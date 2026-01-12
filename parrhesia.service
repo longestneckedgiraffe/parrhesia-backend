@@ -1,0 +1,22 @@
+[Unit]
+Description=a very basic e2e chatting service
+After=network.target
+
+[Service]
+Type=simple
+User=parrhesia
+Group=parrhesia
+WorkingDirectory=/home/parrhesia/parrhesia
+ExecStart=/home/parrhesia/parrhesia/target/release/parrhesia
+Restart=on-failure
+RestartSec=5
+
+# Environment
+Environment=PORT=3000
+Environment=DATABASE_URL=sqlite:./parrhesia.db?mode=rwc
+Environment=INACTIVITY_EXPIRY_HOURS=24
+Environment=CLEANUP_INTERVAL_MINS=5
+Environment=RUST_LOG=parrhesia=info
+
+[Install]
+WantedBy=multi-user.target
