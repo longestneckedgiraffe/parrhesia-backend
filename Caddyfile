@@ -1,4 +1,4 @@
-parrhesia.chat {
+api.parrhesia.chat {
     tls internal
     reverse_proxy localhost:3000
 }
