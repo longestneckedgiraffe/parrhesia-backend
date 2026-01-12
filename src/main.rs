@@ -46,8 +46,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/rooms", post(routes::rooms::create_room))
-        .route("/api/rooms/{id}", get(routes::rooms::get_room))
-        .route("/ws/{room_id}", get(routes::ws::ws_handler))
+        .route("/api/rooms/:id", get(routes::rooms::get_room))
+        .route("/ws/:room_id", get(routes::ws::ws_handler))
         .route("/health", get(|| async { "OK" }))
         .layer(cors)
         .with_state(state);
