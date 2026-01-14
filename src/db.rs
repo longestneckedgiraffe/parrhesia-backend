@@ -191,3 +191,16 @@ pub async fn count_participants(pool: &SqlitePool, room_id: &str) -> Result<i64,
             .await?;
     Ok(result.0)
 }
+
+pub async fn reset_creator_if_empty(pool: &SqlitePool, room_id: &str) -> Result<bool, sqlx::Error> {
+    let count = count_participants(pool, room_id).await?;
+    if count == 0 {
+        sqlx::query("UPDATE rooms SET creator_id = NULL WHERE id = ?")
+            .bind(room_id)
+            .execute(pool)
+            .await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
