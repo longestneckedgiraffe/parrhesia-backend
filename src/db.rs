@@ -182,3 +182,12 @@ pub async fn get_creator(
             .await?;
     Ok(result.and_then(|(id,)| id))
 }
+
+pub async fn count_participants(pool: &SqlitePool, room_id: &str) -> Result<i64, sqlx::Error> {
+    let result: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM participants WHERE room_id = ?")
+            .bind(room_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(result.0)
+}

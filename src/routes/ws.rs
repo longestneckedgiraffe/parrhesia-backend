@@ -12,6 +12,8 @@ use uuid::Uuid;
 use crate::db;
 use crate::state::{AppState, MessageType, RoomMessage};
 
+const MAX_PARTICIPANTS: i64 = 16;
+
 #[derive(Deserialize)]
 struct IncomingMessage {
     #[serde(rename = "type")]
@@ -117,6 +119,17 @@ impl OutgoingMessage {
             creator_id: None,
         }
     }
+
+    fn room_full() -> Self {
+        Self {
+            msg_type: "room_full".to_string(),
+            peer_id: None,
+            public_key: None,
+            payload: None,
+            is_creator: None,
+            creator_id: None,
+        }
+    }
 }
 
 pub async fn ws_handler(
@@ -148,6 +161,21 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
 
     if !exists {
         tracing::warn!("WebSocket connection to non-existent room: {}", room_id);
+        return;
+    }
+
+    let participant_count = match db::count_participants(&state.db, &room_id).await {
+        Ok(count) => count,
+        Err(e) => {
+            tracing::error!("Failed to count participants: {}", e);
+            return;
+        }
+    };
+
+    if participant_count >= MAX_PARTICIPANTS {
+        tracing::warn!("Room {} is full ({} participants)", room_id, participant_count);
+        let (mut ws_sender, _) = socket.split();
+        let _ = send_json(&mut ws_sender, &OutgoingMessage::room_full()).await;
         return;
     }
 
