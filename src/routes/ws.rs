@@ -389,6 +389,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         tracing::error!("Failed to remove participant: {}", e);
     }
 
+    match db::reset_creator_if_empty(&state.db, &room_id).await {
+        Ok(true) => tracing::info!("Room {} is now empty, creator reset", room_id),
+        Ok(false) => {}
+        Err(e) => tracing::error!("Failed to reset creator: {}", e),
+    }
+
     let _ = tx.send(RoomMessage {
         from_conn_id: conn_id.clone(),
         target_conn_id: None,
