@@ -7,12 +7,16 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
+use tokio::time::interval;
 use uuid::Uuid;
 
 use crate::db;
 use crate::state::{AppState, MessageType, RoomMessage};
 
 const MAX_PARTICIPANTS: i64 = 16;
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 struct IncomingMessage {
@@ -273,117 +277,126 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         msg_type: MessageType::PeerJoined,
     });
 
-    let conn_id_clone = conn_id.clone();
-    let room_id_clone = room_id.clone();
-    let forward_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if msg.from_conn_id == conn_id_clone {
-                continue;
-            }
+    let mut ping_interval = interval(PING_INTERVAL);
+    let mut last_pong = Instant::now();
+    let mut waiting_for_pong = false;
 
-            if let Some(ref target) = msg.target_conn_id {
-                if target != &conn_id_clone {
-                    continue;
+    loop {
+        tokio::select! {
+            _ = ping_interval.tick() => {
+                if waiting_for_pong && last_pong.elapsed() > PONG_TIMEOUT {
+                    tracing::warn!("Connection {} timed out (no pong received)", conn_id);
+                    break;
                 }
-            }
 
-            let outgoing = match msg.msg_type {
-                MessageType::Chat => OutgoingMessage::chat(&msg.from_conn_id, &msg.payload),
-                MessageType::KeyShare => {
-                    OutgoingMessage::key_share(&msg.from_conn_id, &msg.payload)
+                if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
+                    tracing::error!("Failed to send ping to {}", conn_id);
+                    break;
                 }
-                MessageType::PeerJoined => {
-                    OutgoingMessage::peer_joined(&msg.from_conn_id, &msg.payload)
-                }
-                MessageType::PeerLeft => OutgoingMessage::peer_left(&msg.from_conn_id),
-                MessageType::RoomExpired => OutgoingMessage::room_expired(),
-            };
-
-            let json = match serde_json::to_string(&outgoing) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-
-            if ws_sender.send(Message::Text(json.into())).await.is_err() {
-                break;
+                waiting_for_pong = true;
             }
 
-            if matches!(msg.msg_type, MessageType::RoomExpired) {
-                let _ = ws_sender.close().await;
-                break;
-            }
-        }
-        tracing::info!(
-            "Forward task ended for {} in room {}",
-            conn_id_clone,
-            room_id_clone
-        );
-    });
+            msg = rx.recv() => {
+                match msg {
+                    Ok(room_msg) => {
+                        if room_msg.from_conn_id == conn_id {
+                            continue;
+                        }
 
-    let state_clone = state.clone();
-    let room_id_clone = room_id.clone();
-    let conn_id_clone = conn_id.clone();
-    while let Some(result) = ws_receiver.next().await {
-        match result {
-            Ok(Message::Text(text)) => {
-                let incoming: IncomingMessage = match serde_json::from_str(&text) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        tracing::warn!("Invalid message format from {}", conn_id_clone);
-                        continue;
-                    }
-                };
-
-                match incoming.msg_type.as_str() {
-                    "message" => {
-                        if let Some(payload) = incoming.payload {
-                            if let Err(e) =
-                                db::update_activity(&state_clone.db, &room_id_clone).await
-                            {
-                                tracing::error!("Failed to update activity: {}", e);
+                        if let Some(ref target) = room_msg.target_conn_id {
+                            if target != &conn_id {
+                                continue;
                             }
+                        }
 
-                            let _ = tx.send(RoomMessage {
-                                from_conn_id: conn_id_clone.clone(),
-                                target_conn_id: None,
-                                payload,
-                                msg_type: MessageType::Chat,
-                            });
+                        let outgoing = match room_msg.msg_type {
+                            MessageType::Chat => OutgoingMessage::chat(&room_msg.from_conn_id, &room_msg.payload),
+                            MessageType::KeyShare => OutgoingMessage::key_share(&room_msg.from_conn_id, &room_msg.payload),
+                            MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload),
+                            MessageType::PeerLeft => OutgoingMessage::peer_left(&room_msg.from_conn_id),
+                            MessageType::RoomExpired => OutgoingMessage::room_expired(),
+                        };
+
+                        if let Ok(json) = serde_json::to_string(&outgoing) {
+                            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+
+                        if matches!(room_msg.msg_type, MessageType::RoomExpired) {
+                            let _ = ws_sender.close().await;
+                            break;
                         }
                     }
-                    "key_share" => {
-                        if let (Some(payload), Some(target_peer_id)) =
-                            (incoming.payload, incoming.target_peer_id)
-                        {
-                            tracing::info!(
-                                "Key share from {} to {}",
-                                conn_id_clone,
-                                target_peer_id
-                            );
-                            let _ = tx.send(RoomMessage {
-                                from_conn_id: conn_id_clone.clone(),
-                                target_conn_id: Some(target_peer_id),
-                                payload,
-                                msg_type: MessageType::KeyShare,
-                            });
+                    Err(_) => break,
+                }
+            }
+
+            msg = ws_receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let incoming: IncomingMessage = match serde_json::from_str(&text) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                tracing::warn!("Invalid message format from {}", conn_id);
+                                continue;
+                            }
+                        };
+
+                        match incoming.msg_type.as_str() {
+                            "message" => {
+                                if let Some(payload) = incoming.payload {
+                                    if let Err(e) = db::update_activity(&state.db, &room_id).await {
+                                        tracing::error!("Failed to update activity: {}", e);
+                                    }
+
+                                    let _ = tx.send(RoomMessage {
+                                        from_conn_id: conn_id.clone(),
+                                        target_conn_id: None,
+                                        payload,
+                                        msg_type: MessageType::Chat,
+                                    });
+                                }
+                            }
+                            "key_share" => {
+                                if let (Some(payload), Some(target_peer_id)) =
+                                    (incoming.payload, incoming.target_peer_id)
+                                {
+                                    tracing::info!("Key share from {} to {}", conn_id, target_peer_id);
+                                    let _ = tx.send(RoomMessage {
+                                        from_conn_id: conn_id.clone(),
+                                        target_conn_id: Some(target_peer_id),
+                                        payload,
+                                        msg_type: MessageType::KeyShare,
+                                    });
+                                }
+                            }
+                            _ => {}
                         }
                     }
+                    Some(Ok(Message::Pong(_))) => {
+                        last_pong = Instant::now();
+                        waiting_for_pong = false;
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        if ws_sender.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        tracing::info!("WebSocket closed by client: {}", conn_id);
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!("WebSocket error for {}: {}", conn_id, e);
+                        break;
+                    }
+                    None => break,
                     _ => {}
                 }
             }
-            Ok(Message::Close(_)) => {
-                tracing::info!("WebSocket closed by client: {}", conn_id_clone);
-                break;
-            }
-            Err(e) => {
-                tracing::error!("WebSocket error for {}: {}", conn_id_clone, e);
-                break;
-            }
-            _ => {}
         }
     }
-
-    forward_task.abort();
 
     if let Err(e) = db::remove_participant(&state.db, &conn_id).await {
         tracing::error!("Failed to remove participant: {}", e);
