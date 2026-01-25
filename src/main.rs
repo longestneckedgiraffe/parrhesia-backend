@@ -10,9 +10,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use http::HeaderValue;
+use http::{header, HeaderValue, Method};
 use std::net::SocketAddr;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::Config;
@@ -43,8 +43,8 @@ async fn main() {
 
     let cors = CorsLayer::new()
         .allow_origin("https://parrhesia.chat".parse::<HeaderValue>().unwrap())
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
 
     let app = Router::new()
         .route("/api/rooms", post(routes::rooms::create_room))
