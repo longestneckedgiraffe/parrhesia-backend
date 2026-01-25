@@ -2,9 +2,11 @@ mod cleanup;
 mod config;
 mod db;
 mod routes;
+mod security;
 mod state;
 
 use axum::{
+    middleware,
     routing::{get, post},
     Router,
 };
@@ -49,6 +51,7 @@ async fn main() {
         .route("/api/rooms/:id", get(routes::rooms::get_room))
         .route("/ws/:room_id", get(routes::ws::ws_handler))
         .route("/health", get(|| async { "OK" }))
+        .layer(middleware::from_fn(security::security_headers))
         .layer(cors)
         .with_state(state);
 
