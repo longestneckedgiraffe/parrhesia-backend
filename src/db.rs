@@ -192,6 +192,34 @@ pub async fn count_participants(pool: &SqlitePool, room_id: &str) -> Result<i64,
     Ok(result.0)
 }
 
+pub async fn try_add_participant(
+    pool: &SqlitePool,
+    participant_id: &str,
+    room_id: &str,
+    public_key: &str,
+    max_participants: i64,
+) -> Result<bool, sqlx::Error> {
+    let now = now_timestamp();
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO participants (id, room_id, public_key, created_at)
+        SELECT ?, ?, ?, ?
+        WHERE (SELECT COUNT(*) FROM participants WHERE room_id = ?) < ?
+        "#,
+    )
+    .bind(participant_id)
+    .bind(room_id)
+    .bind(public_key)
+    .bind(now)
+    .bind(room_id)
+    .bind(max_participants)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn reset_creator_if_empty(pool: &SqlitePool, room_id: &str) -> Result<bool, sqlx::Error> {
     let count = count_participants(pool, room_id).await?;
     if count == 0 {

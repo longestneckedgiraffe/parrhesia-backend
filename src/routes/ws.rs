@@ -176,21 +176,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         return;
     }
 
-    let participant_count = match db::count_participants(&state.db, &room_id).await {
-        Ok(count) => count,
-        Err(e) => {
-            tracing::error!("Failed to count participants: {}", e);
-            return;
-        }
-    };
-
-    if participant_count >= MAX_PARTICIPANTS {
-        tracing::warn!("Room {} is full ({} participants)", room_id, participant_count);
-        let (mut ws_sender, _) = socket.split();
-        let _ = send_json(&mut ws_sender, &OutgoingMessage::room_full()).await;
-        return;
-    }
-
     let conn_id = Uuid::new_v4().to_string();
     tracing::info!("New WebSocket connection: {} to room {}", conn_id, room_id);
 
@@ -256,8 +241,25 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
 
     tracing::info!("Received public key from {}", conn_id);
 
-    if let Err(e) = db::store_public_key(&state.db, &conn_id, &room_id, &public_key).await {
-        tracing::error!("Failed to store public key: {}", e);
+    let added = match db::try_add_participant(
+        &state.db,
+        &conn_id,
+        &room_id,
+        &public_key,
+        MAX_PARTICIPANTS,
+    )
+    .await
+    {
+        Ok(added) => added,
+        Err(e) => {
+            tracing::error!("Failed to add participant: {}", e);
+            return;
+        }
+    };
+
+    if !added {
+        tracing::warn!("Room {} is full", room_id);
+        let _ = send_json(&mut ws_sender, &OutgoingMessage::room_full()).await;
         return;
     }
 
