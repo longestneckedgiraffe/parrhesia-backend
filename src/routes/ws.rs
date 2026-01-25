@@ -5,6 +5,7 @@ use axum::{
     },
     response::Response,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -13,6 +14,13 @@ use uuid::Uuid;
 
 use crate::db;
 use crate::state::{AppState, MessageType, RoomMessage};
+
+fn is_valid_p256_public_key(base64_key: &str) -> bool {
+    match STANDARD.decode(base64_key) {
+        Ok(bytes) => bytes.len() == 65 && bytes[0] == 0x04,
+        Err(_) => false,
+    }
+}
 
 const MAX_PARTICIPANTS: i64 = 16;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -224,6 +232,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                 if let Ok(msg) = serde_json::from_str::<IncomingMessage>(&text) {
                     if msg.msg_type == "key_announce" {
                         if let Some(key) = msg.public_key {
+                            if !is_valid_p256_public_key(&key) {
+                                tracing::warn!("Invalid public key format from {}", conn_id);
+                                return;
+                            }
                             break key;
                         }
                     }
