@@ -45,5 +45,10 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response {
         HeaderValue::from_static("camera=(self), microphone=()"),
     );
 
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+
     response
 }
