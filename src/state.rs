@@ -22,6 +22,7 @@ pub enum MessageType {
     PeerJoined,
     PeerLeft,
     RoomExpired,
+    Typing,
 }
 
 #[derive(Clone)]
