@@ -121,6 +121,17 @@ impl OutgoingMessage {
         }
     }
 
+    fn typing(peer_id: &str) -> Self {
+        Self {
+            msg_type: "typing".to_string(),
+            peer_id: Some(peer_id.to_string()),
+            public_key: None,
+            payload: None,
+            is_creator: None,
+            creator_id: None,
+        }
+    }
+
     fn room_expired() -> Self {
         Self {
             msg_type: "room_expired".to_string(),
@@ -328,6 +339,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                             MessageType::KeyShare => OutgoingMessage::key_share(&room_msg.from_conn_id, &room_msg.payload),
                             MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload),
                             MessageType::PeerLeft => OutgoingMessage::peer_left(&room_msg.from_conn_id),
+                            MessageType::Typing => OutgoingMessage::typing(&room_msg.from_conn_id),
                             MessageType::RoomExpired => OutgoingMessage::room_expired(),
                         };
 
@@ -384,6 +396,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         msg_type: MessageType::KeyShare,
                                     });
                                 }
+                            }
+                            "typing" => {
+                                let _ = tx.send(RoomMessage {
+                                    from_conn_id: conn_id.clone(),
+                                    target_conn_id: None,
+                                    payload: String::new(),
+                                    msg_type: MessageType::Typing,
+                                });
                             }
                             _ => {}
                         }
