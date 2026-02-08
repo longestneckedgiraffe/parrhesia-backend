@@ -15,6 +15,8 @@ pub struct RoomMessage {
     pub msg_type: MessageType,
     pub message_id: Option<String>,
     pub message_ids: Option<Vec<String>>,
+    pub pq_public_key: Option<String>,
+    pub pq_ciphertext: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +76,8 @@ impl AppState {
                     msg_type: MessageType::RoomExpired,
                     message_id: None,
                     message_ids: None,
+                    pq_public_key: None,
+                    pq_ciphertext: None,
                 });
             }
         }
