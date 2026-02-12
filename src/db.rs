@@ -30,6 +30,7 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             id TEXT PRIMARY KEY,
             room_id TEXT NOT NULL,
             public_key TEXT NOT NULL,
+            pq_public_key TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL,
             FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
         )
@@ -37,10 +38,6 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     )
     .execute(&pool)
     .await?;
-
-    let _ = sqlx::query("ALTER TABLE participants ADD COLUMN pq_public_key TEXT")
-        .execute(&pool)
-        .await;
 
     Ok(pool)
 }
@@ -127,8 +124,8 @@ pub async fn get_other_public_keys(
     pool: &SqlitePool,
     room_id: &str,
     exclude_participant_id: &str,
-) -> Result<Vec<(String, String, Option<String>)>, sqlx::Error> {
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT id, public_key, pq_public_key FROM participants WHERE room_id = ? AND id != ?",
     )
     .bind(room_id)
@@ -201,7 +198,7 @@ pub async fn try_add_participant(
     participant_id: &str,
     room_id: &str,
     public_key: &str,
-    pq_public_key: Option<&str>,
+    pq_public_key: &str,
     max_participants: i64,
 ) -> Result<bool, sqlx::Error> {
     let now = now_timestamp();
