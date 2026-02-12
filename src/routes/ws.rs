@@ -22,6 +22,13 @@ fn is_valid_p256_public_key(base64_key: &str) -> bool {
     }
 }
 
+fn is_valid_mlkem768_public_key(base64_key: &str) -> bool {
+    match STANDARD.decode(base64_key) {
+        Ok(bytes) => bytes.len() == 1184,
+        Err(_) => false,
+    }
+}
+
 const MAX_PARTICIPANTS: i64 = 16;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,7 +93,7 @@ impl OutgoingMessage {
         }
     }
 
-    fn peer_key(peer_id: &str, public_key: &str, pq_public_key: Option<&str>) -> Self {
+    fn peer_key(peer_id: &str, public_key: &str, pq_public_key: &str) -> Self {
         Self {
             msg_type: "peer_key".to_string(),
             peer_id: Some(peer_id.to_string()),
@@ -96,12 +103,12 @@ impl OutgoingMessage {
             creator_id: None,
             message_id: None,
             message_ids: None,
-            pq_public_key: pq_public_key.map(|s| s.to_string()),
+            pq_public_key: Some(pq_public_key.to_string()),
             pq_ciphertext: None,
         }
     }
 
-    fn peer_joined(peer_id: &str, public_key: &str, pq_public_key: Option<&str>) -> Self {
+    fn peer_joined(peer_id: &str, public_key: &str, pq_public_key: &str) -> Self {
         Self {
             msg_type: "peer_joined".to_string(),
             peer_id: Some(peer_id.to_string()),
@@ -111,7 +118,7 @@ impl OutgoingMessage {
             creator_id: None,
             message_id: None,
             message_ids: None,
-            pq_public_key: pq_public_key.map(|s| s.to_string()),
+            pq_public_key: Some(pq_public_key.to_string()),
             pq_ciphertext: None,
         }
     }
@@ -299,7 +306,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                 tracing::warn!("Invalid public key format from {}", conn_id);
                                 return;
                             }
-                            break (key, msg.pq_public_key);
+                            match msg.pq_public_key {
+                                Some(pq_key) if is_valid_mlkem768_public_key(&pq_key) => {
+                                    break (key, pq_key);
+                                }
+                                _ => {
+                                    tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -324,7 +339,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         &conn_id,
         &room_id,
         &public_key,
-        pq_public_key.as_deref(),
+        &pq_public_key,
         MAX_PARTICIPANTS,
     )
     .await
@@ -345,7 +360,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
     match db::get_other_public_keys(&state.db, &room_id, &conn_id).await {
         Ok(peers) => {
             for (peer_id, peer_key, peer_pq_key) in peers {
-                if !send_json(&mut ws_sender, &OutgoingMessage::peer_key(&peer_id, &peer_key, peer_pq_key.as_deref())).await
+                if !send_json(&mut ws_sender, &OutgoingMessage::peer_key(&peer_id, &peer_key, &peer_pq_key)).await
                 {
                     tracing::error!("Failed to send peer key");
                     let _ = db::remove_participant(&state.db, &conn_id).await;
@@ -370,7 +385,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         msg_type: MessageType::PeerJoined,
         message_id: None,
         message_ids: None,
-        pq_public_key: pq_public_key.clone(),
+        pq_public_key: Some(pq_public_key.clone()),
         pq_ciphertext: None,
     });
 
@@ -409,7 +424,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                         let outgoing = match room_msg.msg_type {
                             MessageType::Chat => OutgoingMessage::chat(&room_msg.from_conn_id, &room_msg.payload, room_msg.message_id),
                             MessageType::KeyShare => OutgoingMessage::key_share(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_ciphertext.as_deref()),
-                            MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_public_key.as_deref()),
+                            MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_public_key.as_deref().unwrap_or_default()),
                             MessageType::PeerLeft => OutgoingMessage::peer_left(&room_msg.from_conn_id),
                             MessageType::Typing => OutgoingMessage::typing(&room_msg.from_conn_id),
                             MessageType::Read => OutgoingMessage::read(&room_msg.from_conn_id, room_msg.message_ids.unwrap_or_default()),
@@ -462,8 +477,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                 }
                             }
                             "key_share" => {
-                                if let (Some(payload), Some(target_peer_id)) =
-                                    (incoming.payload, incoming.target_peer_id)
+                                if let (Some(payload), Some(target_peer_id), Some(pq_ct)) =
+                                    (incoming.payload, incoming.target_peer_id, incoming.pq_ciphertext)
                                 {
                                     tracing::info!("Key share from {} to {}", conn_id, target_peer_id);
                                     let _ = tx.send(RoomMessage {
@@ -474,7 +489,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         message_id: None,
                                         message_ids: None,
                                         pq_public_key: None,
-                                        pq_ciphertext: incoming.pq_ciphertext,
+                                        pq_ciphertext: Some(pq_ct),
                                     });
                                 }
                             }
