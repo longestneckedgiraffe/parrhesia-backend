@@ -15,9 +15,9 @@ use uuid::Uuid;
 use crate::db;
 use crate::state::{AppState, MessageType, RoomMessage};
 
-fn is_valid_p256_public_key(base64_key: &str) -> bool {
+fn is_valid_mldsa65_public_key(base64_key: &str) -> bool {
     match STANDARD.decode(base64_key) {
-        Ok(bytes) => bytes.len() == 65 && bytes[0] == 0x04,
+        Ok(bytes) => bytes.len() == 1952,
         Err(_) => false,
     }
 }
@@ -51,6 +51,8 @@ struct IncomingMessage {
     pq_public_key: Option<String>,
     #[serde(default)]
     pq_ciphertext: Option<String>,
+    #[serde(default)]
+    sig: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -75,6 +77,8 @@ struct OutgoingMessage {
     pq_public_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pq_ciphertext: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sig: Option<String>,
 }
 
 impl OutgoingMessage {
@@ -90,10 +94,11 @@ impl OutgoingMessage {
             message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
+            sig: None,
         }
     }
 
-    fn peer_key(peer_id: &str, public_key: &str, pq_public_key: &str) -> Self {
+    fn peer_key(peer_id: &str, public_key: &str, pq_public_key: &str, sig: Option<&str>) -> Self {
         Self {
             msg_type: "peer_key".to_string(),
             peer_id: Some(peer_id.to_string()),
@@ -105,10 +110,11 @@ impl OutgoingMessage {
             message_ids: None,
             pq_public_key: Some(pq_public_key.to_string()),
             pq_ciphertext: None,
+            sig: sig.map(|s| s.to_string()),
         }
     }
 
-    fn peer_joined(peer_id: &str, public_key: &str, pq_public_key: &str) -> Self {
+    fn peer_joined(peer_id: &str, public_key: &str, pq_public_key: &str, sig: Option<&str>) -> Self {
         Self {
             msg_type: "peer_joined".to_string(),
             peer_id: Some(peer_id.to_string()),
@@ -120,6 +126,7 @@ impl OutgoingMessage {
             message_ids: None,
             pq_public_key: Some(pq_public_key.to_string()),
             pq_ciphertext: None,
+            sig: sig.map(|s| s.to_string()),
         }
     }
 
@@ -135,6 +142,7 @@ impl OutgoingMessage {
             message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
+            sig: None,
         }
     }
 
@@ -150,10 +158,11 @@ impl OutgoingMessage {
             message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
+            sig: None,
         }
     }
 
-    fn key_share(from_peer_id: &str, payload: &str, pq_ciphertext: Option<&str>) -> Self {
+    fn key_share(from_peer_id: &str, payload: &str, pq_ciphertext: Option<&str>, sig: Option<&str>) -> Self {
         Self {
             msg_type: "key_share".to_string(),
             peer_id: Some(from_peer_id.to_string()),
@@ -165,6 +174,7 @@ impl OutgoingMessage {
             message_ids: None,
             pq_public_key: None,
             pq_ciphertext: pq_ciphertext.map(|s| s.to_string()),
+            sig: sig.map(|s| s.to_string()),
         }
     }
 
@@ -180,6 +190,7 @@ impl OutgoingMessage {
             message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
+            sig: None,
         }
     }
 
@@ -195,6 +206,7 @@ impl OutgoingMessage {
             message_ids: Some(message_ids),
             pq_public_key: None,
             pq_ciphertext: None,
+            sig: None,
         }
     }
 
@@ -210,6 +222,7 @@ impl OutgoingMessage {
             message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
+            sig: None,
         }
     }
 
@@ -225,6 +238,7 @@ impl OutgoingMessage {
             message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
+            sig: None,
         }
     }
 }
@@ -296,19 +310,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         return;
     }
 
-    let (public_key, pq_public_key) = loop {
+    let (public_key, pq_public_key, announce_sig) = loop {
         match ws_receiver.next().await {
             Some(Ok(Message::Text(text))) => {
                 if let Ok(msg) = serde_json::from_str::<IncomingMessage>(&text) {
                     if msg.msg_type == "key_announce" {
                         if let Some(key) = msg.public_key {
-                            if !is_valid_p256_public_key(&key) {
+                            if !is_valid_mldsa65_public_key(&key) {
                                 tracing::warn!("Invalid public key format from {}", conn_id);
                                 return;
                             }
                             match msg.pq_public_key {
                                 Some(pq_key) if is_valid_mlkem768_public_key(&pq_key) => {
-                                    break (key, pq_key);
+                                    break (key, pq_key, msg.sig);
                                 }
                                 _ => {
                                     tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
@@ -340,6 +354,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         &room_id,
         &public_key,
         &pq_public_key,
+        announce_sig.as_deref(),
         MAX_PARTICIPANTS,
     )
     .await
@@ -359,8 +374,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
 
     match db::get_other_public_keys(&state.db, &room_id, &conn_id).await {
         Ok(peers) => {
-            for (peer_id, peer_key, peer_pq_key) in peers {
-                if !send_json(&mut ws_sender, &OutgoingMessage::peer_key(&peer_id, &peer_key, &peer_pq_key)).await
+            for (peer_id, peer_key, peer_pq_key, peer_sig) in peers {
+                if !send_json(&mut ws_sender, &OutgoingMessage::peer_key(&peer_id, &peer_key, &peer_pq_key, peer_sig.as_deref())).await
                 {
                     tracing::error!("Failed to send peer key");
                     let _ = db::remove_participant(&state.db, &conn_id).await;
@@ -387,6 +402,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         message_ids: None,
         pq_public_key: Some(pq_public_key.clone()),
         pq_ciphertext: None,
+        sig: announce_sig,
     });
 
     let mut ping_interval = interval(PING_INTERVAL);
@@ -423,8 +439,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
 
                         let outgoing = match room_msg.msg_type {
                             MessageType::Chat => OutgoingMessage::chat(&room_msg.from_conn_id, &room_msg.payload, room_msg.message_id),
-                            MessageType::KeyShare => OutgoingMessage::key_share(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_ciphertext.as_deref()),
-                            MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_public_key.as_deref().unwrap_or_default()),
+                            MessageType::KeyShare => OutgoingMessage::key_share(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_ciphertext.as_deref(), room_msg.sig.as_deref()),
+                            MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_public_key.as_deref().unwrap_or_default(), room_msg.sig.as_deref()),
                             MessageType::PeerLeft => OutgoingMessage::peer_left(&room_msg.from_conn_id),
                             MessageType::Typing => OutgoingMessage::typing(&room_msg.from_conn_id),
                             MessageType::Read => OutgoingMessage::read(&room_msg.from_conn_id, room_msg.message_ids.unwrap_or_default()),
@@ -473,6 +489,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         message_ids: None,
                                         pq_public_key: None,
                                         pq_ciphertext: None,
+                                        sig: None,
                                     });
                                 }
                             }
@@ -490,6 +507,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         message_ids: None,
                                         pq_public_key: None,
                                         pq_ciphertext: Some(pq_ct),
+                                        sig: incoming.sig,
                                     });
                                 }
                             }
@@ -503,6 +521,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                     message_ids: None,
                                     pq_public_key: None,
                                     pq_ciphertext: None,
+                                    sig: None,
                                 });
                             }
                             "read" => {
@@ -516,6 +535,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         message_ids: Some(message_ids),
                                         pq_public_key: None,
                                         pq_ciphertext: None,
+                                        sig: None,
                                     });
                                 }
                             }
@@ -565,6 +585,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         message_ids: None,
         pq_public_key: None,
         pq_ciphertext: None,
+        sig: None,
     });
 
     tracing::info!("Connection {} disconnected from room {}", conn_id, room_id);

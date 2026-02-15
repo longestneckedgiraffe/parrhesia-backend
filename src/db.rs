@@ -39,6 +39,10 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
+    let _ = sqlx::query("ALTER TABLE participants ADD COLUMN sig TEXT")
+        .execute(&pool)
+        .await;
+
     Ok(pool)
 }
 
@@ -124,9 +128,9 @@ pub async fn get_other_public_keys(
     pool: &SqlitePool,
     room_id: &str,
     exclude_participant_id: &str,
-) -> Result<Vec<(String, String, String)>, sqlx::Error> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id, public_key, pq_public_key FROM participants WHERE room_id = ? AND id != ?",
+) -> Result<Vec<(String, String, String, Option<String>)>, sqlx::Error> {
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, public_key, pq_public_key, sig FROM participants WHERE room_id = ? AND id != ?",
     )
     .bind(room_id)
     .bind(exclude_participant_id)
@@ -199,14 +203,15 @@ pub async fn try_add_participant(
     room_id: &str,
     public_key: &str,
     pq_public_key: &str,
+    sig: Option<&str>,
     max_participants: i64,
 ) -> Result<bool, sqlx::Error> {
     let now = now_timestamp();
 
     let result = sqlx::query(
         r#"
-        INSERT INTO participants (id, room_id, public_key, pq_public_key, created_at)
-        SELECT ?, ?, ?, ?, ?
+        INSERT INTO participants (id, room_id, public_key, pq_public_key, sig, created_at)
+        SELECT ?, ?, ?, ?, ?, ?
         WHERE (SELECT COUNT(*) FROM participants WHERE room_id = ?) < ?
         "#,
     )
@@ -214,6 +219,7 @@ pub async fn try_add_participant(
     .bind(room_id)
     .bind(public_key)
     .bind(pq_public_key)
+    .bind(sig)
     .bind(now)
     .bind(room_id)
     .bind(max_participants)

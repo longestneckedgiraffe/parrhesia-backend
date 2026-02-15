@@ -17,6 +17,7 @@ pub struct RoomMessage {
     pub message_ids: Option<Vec<String>>,
     pub pq_public_key: Option<String>,
     pub pq_ciphertext: Option<String>,
+    pub sig: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +79,7 @@ impl AppState {
                     message_ids: None,
                     pq_public_key: None,
                     pq_ciphertext: None,
+                    sig: None,
                 });
             }
         }
