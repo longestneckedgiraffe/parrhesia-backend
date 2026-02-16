@@ -57,6 +57,10 @@ struct IncomingMessage {
     epoch: Option<u64>,
     #[serde(default)]
     counter: Option<u64>,
+    #[serde(default)]
+    tree_commit: Option<String>,
+    #[serde(default)]
+    tree_welcome: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -87,6 +91,10 @@ struct OutgoingMessage {
     epoch: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     counter: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree_welcome: Option<String>,
 }
 
 impl OutgoingMessage {
@@ -105,6 +113,8 @@ impl OutgoingMessage {
             sig: None,
             epoch: None,
             counter: None,
+            tree_commit: None,
+            tree_welcome: None,
         }
     }
 
@@ -123,6 +133,8 @@ impl OutgoingMessage {
             sig: sig.map(|s| s.to_string()),
             epoch: None,
             counter: None,
+            tree_commit: None,
+            tree_welcome: None,
         }
     }
 
@@ -141,6 +153,8 @@ impl OutgoingMessage {
             sig: sig.map(|s| s.to_string()),
             epoch: None,
             counter: None,
+            tree_commit: None,
+            tree_welcome: None,
         }
     }
 
@@ -159,6 +173,8 @@ impl OutgoingMessage {
             sig: None,
             epoch: None,
             counter: None,
+            tree_commit: None,
+            tree_welcome: None,
         }
     }
 
@@ -177,24 +193,28 @@ impl OutgoingMessage {
             sig: None,
             epoch,
             counter,
+            tree_commit: None,
+            tree_welcome: None,
         }
     }
 
-    fn key_share(from_peer_id: &str, payload: &str, pq_ciphertext: Option<&str>, sig: Option<&str>, epoch: Option<u64>) -> Self {
+    fn tree_commit(peer_id: &str, tree_commit: &str) -> Self {
         Self {
-            msg_type: "key_share".to_string(),
-            peer_id: Some(from_peer_id.to_string()),
+            msg_type: "tree_commit".to_string(),
+            peer_id: Some(peer_id.to_string()),
             public_key: None,
-            payload: Some(payload.to_string()),
+            payload: None,
             is_creator: None,
             creator_id: None,
             message_id: None,
             message_ids: None,
             pq_public_key: None,
-            pq_ciphertext: pq_ciphertext.map(|s| s.to_string()),
-            sig: sig.map(|s| s.to_string()),
-            epoch,
+            pq_ciphertext: None,
+            sig: None,
+            epoch: None,
             counter: None,
+            tree_commit: Some(tree_commit.to_string()),
+            tree_welcome: None,
         }
     }
 
@@ -213,6 +233,8 @@ impl OutgoingMessage {
             sig: None,
             epoch: None,
             counter: None,
+            tree_commit: None,
+            tree_welcome: None,
         }
     }
 
@@ -231,6 +253,8 @@ impl OutgoingMessage {
             sig: None,
             epoch: None,
             counter: None,
+            tree_commit: None,
+            tree_welcome: None,
         }
     }
 
@@ -249,24 +273,28 @@ impl OutgoingMessage {
             sig: None,
             epoch: None,
             counter: None,
+            tree_commit: None,
+            tree_welcome: None,
         }
     }
 
-    fn rekey(from_peer_id: &str, payload: &str, pq_ciphertext: Option<&str>, sig: Option<&str>, epoch: Option<u64>) -> Self {
+    fn tree_welcome(tree_welcome: &str) -> Self {
         Self {
-            msg_type: "rekey".to_string(),
-            peer_id: Some(from_peer_id.to_string()),
+            msg_type: "tree_welcome".to_string(),
+            peer_id: None,
             public_key: None,
-            payload: Some(payload.to_string()),
+            payload: None,
             is_creator: None,
             creator_id: None,
             message_id: None,
             message_ids: None,
             pq_public_key: None,
-            pq_ciphertext: pq_ciphertext.map(|s| s.to_string()),
-            sig: sig.map(|s| s.to_string()),
-            epoch,
+            pq_ciphertext: None,
+            sig: None,
+            epoch: None,
             counter: None,
+            tree_commit: None,
+            tree_welcome: Some(tree_welcome.to_string()),
         }
     }
 
@@ -285,6 +313,8 @@ impl OutgoingMessage {
             sig: None,
             epoch: None,
             counter: None,
+            tree_commit: None,
+            tree_welcome: None,
         }
     }
 }
@@ -451,6 +481,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         sig: announce_sig,
         epoch: None,
         counter: None,
+        tree_data: None,
     });
 
     let mut ping_interval = interval(PING_INTERVAL);
@@ -487,8 +518,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
 
                         let outgoing = match room_msg.msg_type {
                             MessageType::Chat => OutgoingMessage::chat(&room_msg.from_conn_id, &room_msg.payload, room_msg.message_id, room_msg.epoch, room_msg.counter),
-                            MessageType::KeyShare => OutgoingMessage::key_share(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_ciphertext.as_deref(), room_msg.sig.as_deref(), room_msg.epoch),
-                            MessageType::Rekey => OutgoingMessage::rekey(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_ciphertext.as_deref(), room_msg.sig.as_deref(), room_msg.epoch),
+                            MessageType::TreeCommit => OutgoingMessage::tree_commit(&room_msg.from_conn_id, room_msg.tree_data.as_deref().unwrap_or_default()),
+                            MessageType::TreeWelcome => OutgoingMessage::tree_welcome(room_msg.tree_data.as_deref().unwrap_or_default()),
                             MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_public_key.as_deref().unwrap_or_default(), room_msg.sig.as_deref()),
                             MessageType::PeerLeft => OutgoingMessage::peer_left(&room_msg.from_conn_id),
                             MessageType::Typing => OutgoingMessage::typing(&room_msg.from_conn_id),
@@ -541,46 +572,47 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         sig: None,
                                         epoch: incoming.epoch,
                                         counter: incoming.counter,
+                                        tree_data: None,
                                     });
                                 }
                             }
-                            "key_share" => {
-                                if let (Some(payload), Some(target_peer_id), Some(pq_ct)) =
-                                    (incoming.payload, incoming.target_peer_id, incoming.pq_ciphertext)
-                                {
-                                    tracing::info!("Key share from {} to {}", conn_id, target_peer_id);
+                            "tree_commit" => {
+                                if let Some(tree_commit) = incoming.tree_commit {
+                                    tracing::info!("Tree commit from {}", conn_id);
                                     let _ = tx.send(RoomMessage {
                                         from_conn_id: conn_id.clone(),
-                                        target_conn_id: Some(target_peer_id),
-                                        payload,
-                                        msg_type: MessageType::KeyShare,
+                                        target_conn_id: None,
+                                        payload: String::new(),
+                                        msg_type: MessageType::TreeCommit,
                                         message_id: None,
                                         message_ids: None,
                                         pq_public_key: None,
-                                        pq_ciphertext: Some(pq_ct),
-                                        sig: incoming.sig,
-                                        epoch: incoming.epoch,
+                                        pq_ciphertext: None,
+                                        sig: None,
+                                        epoch: None,
                                         counter: None,
+                                        tree_data: Some(tree_commit),
                                     });
                                 }
                             }
-                            "rekey" => {
-                                if let (Some(payload), Some(target_peer_id)) =
-                                    (incoming.payload, incoming.target_peer_id)
+                            "tree_welcome" => {
+                                if let (Some(tree_welcome), Some(target_peer_id)) =
+                                    (incoming.tree_welcome, incoming.target_peer_id)
                                 {
-                                    tracing::info!("Rekey from {} to {}", conn_id, target_peer_id);
+                                    tracing::info!("Tree welcome from {} to {}", conn_id, target_peer_id);
                                     let _ = tx.send(RoomMessage {
                                         from_conn_id: conn_id.clone(),
                                         target_conn_id: Some(target_peer_id),
-                                        payload,
-                                        msg_type: MessageType::Rekey,
+                                        payload: String::new(),
+                                        msg_type: MessageType::TreeWelcome,
                                         message_id: None,
                                         message_ids: None,
                                         pq_public_key: None,
-                                        pq_ciphertext: incoming.pq_ciphertext,
-                                        sig: incoming.sig,
-                                        epoch: incoming.epoch,
+                                        pq_ciphertext: None,
+                                        sig: None,
+                                        epoch: None,
                                         counter: None,
+                                        tree_data: Some(tree_welcome),
                                     });
                                 }
                             }
@@ -597,6 +629,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                     sig: None,
                                     epoch: None,
                                     counter: None,
+                                    tree_data: None,
                                 });
                             }
                             "read" => {
@@ -613,6 +646,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         sig: None,
                                         epoch: None,
                                         counter: None,
+                                        tree_data: None,
                                     });
                                 }
                             }
@@ -665,6 +699,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         sig: None,
         epoch: None,
         counter: None,
+        tree_data: None,
     });
 
     tracing::info!("Connection {} disconnected from room {}", conn_id, room_id);
