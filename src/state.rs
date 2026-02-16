@@ -20,18 +20,19 @@ pub struct RoomMessage {
     pub sig: Option<String>,
     pub epoch: Option<u64>,
     pub counter: Option<u64>,
+    pub tree_data: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub enum MessageType {
     Chat,
-    KeyShare,
+    TreeCommit,
+    TreeWelcome,
     PeerJoined,
     PeerLeft,
     RoomExpired,
     Typing,
     Read,
-    Rekey,
 }
 
 #[derive(Clone)]
@@ -85,6 +86,7 @@ impl AppState {
                     sig: None,
                     epoch: None,
                     counter: None,
+                    tree_data: None,
                 });
             }
         }
