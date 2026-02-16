@@ -53,6 +53,10 @@ struct IncomingMessage {
     pq_ciphertext: Option<String>,
     #[serde(default)]
     sig: Option<String>,
+    #[serde(default)]
+    epoch: Option<u64>,
+    #[serde(default)]
+    counter: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -79,6 +83,10 @@ struct OutgoingMessage {
     pq_ciphertext: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sig: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    counter: Option<u64>,
 }
 
 impl OutgoingMessage {
@@ -95,6 +103,8 @@ impl OutgoingMessage {
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
+            epoch: None,
+            counter: None,
         }
     }
 
@@ -111,6 +121,8 @@ impl OutgoingMessage {
             pq_public_key: Some(pq_public_key.to_string()),
             pq_ciphertext: None,
             sig: sig.map(|s| s.to_string()),
+            epoch: None,
+            counter: None,
         }
     }
 
@@ -127,6 +139,8 @@ impl OutgoingMessage {
             pq_public_key: Some(pq_public_key.to_string()),
             pq_ciphertext: None,
             sig: sig.map(|s| s.to_string()),
+            epoch: None,
+            counter: None,
         }
     }
 
@@ -143,10 +157,12 @@ impl OutgoingMessage {
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
+            epoch: None,
+            counter: None,
         }
     }
 
-    fn chat(peer_id: &str, payload: &str, message_id: Option<String>) -> Self {
+    fn chat(peer_id: &str, payload: &str, message_id: Option<String>, epoch: Option<u64>, counter: Option<u64>) -> Self {
         Self {
             msg_type: "message".to_string(),
             peer_id: Some(peer_id.to_string()),
@@ -159,10 +175,12 @@ impl OutgoingMessage {
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
+            epoch,
+            counter,
         }
     }
 
-    fn key_share(from_peer_id: &str, payload: &str, pq_ciphertext: Option<&str>, sig: Option<&str>) -> Self {
+    fn key_share(from_peer_id: &str, payload: &str, pq_ciphertext: Option<&str>, sig: Option<&str>, epoch: Option<u64>) -> Self {
         Self {
             msg_type: "key_share".to_string(),
             peer_id: Some(from_peer_id.to_string()),
@@ -175,6 +193,8 @@ impl OutgoingMessage {
             pq_public_key: None,
             pq_ciphertext: pq_ciphertext.map(|s| s.to_string()),
             sig: sig.map(|s| s.to_string()),
+            epoch,
+            counter: None,
         }
     }
 
@@ -191,6 +211,8 @@ impl OutgoingMessage {
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
+            epoch: None,
+            counter: None,
         }
     }
 
@@ -207,6 +229,8 @@ impl OutgoingMessage {
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
+            epoch: None,
+            counter: None,
         }
     }
 
@@ -223,6 +247,26 @@ impl OutgoingMessage {
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
+            epoch: None,
+            counter: None,
+        }
+    }
+
+    fn rekey(from_peer_id: &str, payload: &str, pq_ciphertext: Option<&str>, sig: Option<&str>, epoch: Option<u64>) -> Self {
+        Self {
+            msg_type: "rekey".to_string(),
+            peer_id: Some(from_peer_id.to_string()),
+            public_key: None,
+            payload: Some(payload.to_string()),
+            is_creator: None,
+            creator_id: None,
+            message_id: None,
+            message_ids: None,
+            pq_public_key: None,
+            pq_ciphertext: pq_ciphertext.map(|s| s.to_string()),
+            sig: sig.map(|s| s.to_string()),
+            epoch,
+            counter: None,
         }
     }
 
@@ -239,6 +283,8 @@ impl OutgoingMessage {
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
+            epoch: None,
+            counter: None,
         }
     }
 }
@@ -403,6 +449,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         pq_public_key: Some(pq_public_key.clone()),
         pq_ciphertext: None,
         sig: announce_sig,
+        epoch: None,
+        counter: None,
     });
 
     let mut ping_interval = interval(PING_INTERVAL);
@@ -438,8 +486,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                         }
 
                         let outgoing = match room_msg.msg_type {
-                            MessageType::Chat => OutgoingMessage::chat(&room_msg.from_conn_id, &room_msg.payload, room_msg.message_id),
-                            MessageType::KeyShare => OutgoingMessage::key_share(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_ciphertext.as_deref(), room_msg.sig.as_deref()),
+                            MessageType::Chat => OutgoingMessage::chat(&room_msg.from_conn_id, &room_msg.payload, room_msg.message_id, room_msg.epoch, room_msg.counter),
+                            MessageType::KeyShare => OutgoingMessage::key_share(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_ciphertext.as_deref(), room_msg.sig.as_deref(), room_msg.epoch),
+                            MessageType::Rekey => OutgoingMessage::rekey(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_ciphertext.as_deref(), room_msg.sig.as_deref(), room_msg.epoch),
                             MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_public_key.as_deref().unwrap_or_default(), room_msg.sig.as_deref()),
                             MessageType::PeerLeft => OutgoingMessage::peer_left(&room_msg.from_conn_id),
                             MessageType::Typing => OutgoingMessage::typing(&room_msg.from_conn_id),
@@ -490,6 +539,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         pq_public_key: None,
                                         pq_ciphertext: None,
                                         sig: None,
+                                        epoch: incoming.epoch,
+                                        counter: incoming.counter,
                                     });
                                 }
                             }
@@ -508,6 +559,28 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         pq_public_key: None,
                                         pq_ciphertext: Some(pq_ct),
                                         sig: incoming.sig,
+                                        epoch: incoming.epoch,
+                                        counter: None,
+                                    });
+                                }
+                            }
+                            "rekey" => {
+                                if let (Some(payload), Some(target_peer_id)) =
+                                    (incoming.payload, incoming.target_peer_id)
+                                {
+                                    tracing::info!("Rekey from {} to {}", conn_id, target_peer_id);
+                                    let _ = tx.send(RoomMessage {
+                                        from_conn_id: conn_id.clone(),
+                                        target_conn_id: Some(target_peer_id),
+                                        payload,
+                                        msg_type: MessageType::Rekey,
+                                        message_id: None,
+                                        message_ids: None,
+                                        pq_public_key: None,
+                                        pq_ciphertext: incoming.pq_ciphertext,
+                                        sig: incoming.sig,
+                                        epoch: incoming.epoch,
+                                        counter: None,
                                     });
                                 }
                             }
@@ -522,6 +595,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                     pq_public_key: None,
                                     pq_ciphertext: None,
                                     sig: None,
+                                    epoch: None,
+                                    counter: None,
                                 });
                             }
                             "read" => {
@@ -536,6 +611,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         pq_public_key: None,
                                         pq_ciphertext: None,
                                         sig: None,
+                                        epoch: None,
+                                        counter: None,
                                     });
                                 }
                             }
@@ -586,6 +663,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         pq_public_key: None,
         pq_ciphertext: None,
         sig: None,
+        epoch: None,
+        counter: None,
     });
 
     tracing::info!("Connection {} disconnected from room {}", conn_id, room_id);

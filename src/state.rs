@@ -18,6 +18,8 @@ pub struct RoomMessage {
     pub pq_public_key: Option<String>,
     pub pq_ciphertext: Option<String>,
     pub sig: Option<String>,
+    pub epoch: Option<u64>,
+    pub counter: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +31,7 @@ pub enum MessageType {
     RoomExpired,
     Typing,
     Read,
+    Rekey,
 }
 
 #[derive(Clone)]
@@ -80,6 +83,8 @@ impl AppState {
                     pq_public_key: None,
                     pq_ciphertext: None,
                     sig: None,
+                    epoch: None,
+                    counter: None,
                 });
             }
         }
