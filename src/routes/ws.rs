@@ -44,10 +44,6 @@ struct IncomingMessage {
     #[serde(default)]
     target_peer_id: Option<String>,
     #[serde(default)]
-    message_id: Option<String>,
-    #[serde(default)]
-    message_ids: Option<Vec<String>>,
-    #[serde(default)]
     pq_public_key: Option<String>,
     #[serde(default)]
     pq_ciphertext: Option<String>,
@@ -78,10 +74,6 @@ struct OutgoingMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     creator_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    message_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message_ids: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pq_public_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pq_ciphertext: Option<String>,
@@ -106,8 +98,6 @@ impl OutgoingMessage {
             payload: None,
             is_creator: Some(is_creator),
             creator_id: creator_id.map(|s| s.to_string()),
-            message_id: None,
-            message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
@@ -126,8 +116,6 @@ impl OutgoingMessage {
             payload: None,
             is_creator: None,
             creator_id: None,
-            message_id: None,
-            message_ids: None,
             pq_public_key: Some(pq_public_key.to_string()),
             pq_ciphertext: None,
             sig: sig.map(|s| s.to_string()),
@@ -146,8 +134,6 @@ impl OutgoingMessage {
             payload: None,
             is_creator: None,
             creator_id: None,
-            message_id: None,
-            message_ids: None,
             pq_public_key: Some(pq_public_key.to_string()),
             pq_ciphertext: None,
             sig: sig.map(|s| s.to_string()),
@@ -166,8 +152,6 @@ impl OutgoingMessage {
             payload: None,
             is_creator: None,
             creator_id: None,
-            message_id: None,
-            message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
@@ -178,7 +162,7 @@ impl OutgoingMessage {
         }
     }
 
-    fn chat(peer_id: &str, payload: &str, message_id: Option<String>, epoch: Option<u64>, counter: Option<u64>) -> Self {
+    fn chat(peer_id: &str, payload: &str, epoch: Option<u64>, counter: Option<u64>) -> Self {
         Self {
             msg_type: "message".to_string(),
             peer_id: Some(peer_id.to_string()),
@@ -186,8 +170,6 @@ impl OutgoingMessage {
             payload: Some(payload.to_string()),
             is_creator: None,
             creator_id: None,
-            message_id,
-            message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
@@ -206,8 +188,6 @@ impl OutgoingMessage {
             payload: None,
             is_creator: None,
             creator_id: None,
-            message_id: None,
-            message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
@@ -226,28 +206,6 @@ impl OutgoingMessage {
             payload: None,
             is_creator: None,
             creator_id: None,
-            message_id: None,
-            message_ids: None,
-            pq_public_key: None,
-            pq_ciphertext: None,
-            sig: None,
-            epoch: None,
-            counter: None,
-            tree_commit: None,
-            tree_welcome: None,
-        }
-    }
-
-    fn read(peer_id: &str, message_ids: Vec<String>) -> Self {
-        Self {
-            msg_type: "read".to_string(),
-            peer_id: Some(peer_id.to_string()),
-            public_key: None,
-            payload: None,
-            is_creator: None,
-            creator_id: None,
-            message_id: None,
-            message_ids: Some(message_ids),
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
@@ -266,8 +224,6 @@ impl OutgoingMessage {
             payload: None,
             is_creator: None,
             creator_id: None,
-            message_id: None,
-            message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
@@ -286,8 +242,6 @@ impl OutgoingMessage {
             payload: None,
             is_creator: None,
             creator_id: None,
-            message_id: None,
-            message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
@@ -306,8 +260,6 @@ impl OutgoingMessage {
             payload: None,
             is_creator: None,
             creator_id: None,
-            message_id: None,
-            message_ids: None,
             pq_public_key: None,
             pq_ciphertext: None,
             sig: None,
@@ -474,8 +426,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         target_conn_id: None,
         payload: public_key.clone(),
         msg_type: MessageType::PeerJoined,
-        message_id: None,
-        message_ids: None,
         pq_public_key: Some(pq_public_key.clone()),
         pq_ciphertext: None,
         sig: announce_sig,
@@ -517,13 +467,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                         }
 
                         let outgoing = match room_msg.msg_type {
-                            MessageType::Chat => OutgoingMessage::chat(&room_msg.from_conn_id, &room_msg.payload, room_msg.message_id, room_msg.epoch, room_msg.counter),
+                            MessageType::Chat => OutgoingMessage::chat(&room_msg.from_conn_id, &room_msg.payload, room_msg.epoch, room_msg.counter),
                             MessageType::TreeCommit => OutgoingMessage::tree_commit(&room_msg.from_conn_id, room_msg.tree_data.as_deref().unwrap_or_default()),
                             MessageType::TreeWelcome => OutgoingMessage::tree_welcome(room_msg.tree_data.as_deref().unwrap_or_default()),
                             MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_public_key.as_deref().unwrap_or_default(), room_msg.sig.as_deref()),
                             MessageType::PeerLeft => OutgoingMessage::peer_left(&room_msg.from_conn_id),
                             MessageType::Typing => OutgoingMessage::typing(&room_msg.from_conn_id),
-                            MessageType::Read => OutgoingMessage::read(&room_msg.from_conn_id, room_msg.message_ids.unwrap_or_default()),
                             MessageType::RoomExpired => OutgoingMessage::room_expired(),
                         };
 
@@ -565,8 +514,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         target_conn_id: None,
                                         payload,
                                         msg_type: MessageType::Chat,
-                                        message_id: incoming.message_id,
-                                        message_ids: None,
                                         pq_public_key: None,
                                         pq_ciphertext: None,
                                         sig: None,
@@ -584,8 +531,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         target_conn_id: None,
                                         payload: String::new(),
                                         msg_type: MessageType::TreeCommit,
-                                        message_id: None,
-                                        message_ids: None,
                                         pq_public_key: None,
                                         pq_ciphertext: None,
                                         sig: None,
@@ -605,8 +550,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                         target_conn_id: Some(target_peer_id),
                                         payload: String::new(),
                                         msg_type: MessageType::TreeWelcome,
-                                        message_id: None,
-                                        message_ids: None,
                                         pq_public_key: None,
                                         pq_ciphertext: None,
                                         sig: None,
@@ -622,8 +565,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                     target_conn_id: None,
                                     payload: String::new(),
                                     msg_type: MessageType::Typing,
-                                    message_id: None,
-                                    message_ids: None,
                                     pq_public_key: None,
                                     pq_ciphertext: None,
                                     sig: None,
@@ -631,24 +572,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                     counter: None,
                                     tree_data: None,
                                 });
-                            }
-                            "read" => {
-                                if let Some(message_ids) = incoming.message_ids {
-                                    let _ = tx.send(RoomMessage {
-                                        from_conn_id: conn_id.clone(),
-                                        target_conn_id: None,
-                                        payload: String::new(),
-                                        msg_type: MessageType::Read,
-                                        message_id: None,
-                                        message_ids: Some(message_ids),
-                                        pq_public_key: None,
-                                        pq_ciphertext: None,
-                                        sig: None,
-                                        epoch: None,
-                                        counter: None,
-                                        tree_data: None,
-                                    });
-                                }
                             }
                             _ => {}
                         }
@@ -692,8 +615,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         target_conn_id: None,
         payload: String::new(),
         msg_type: MessageType::PeerLeft,
-        message_id: None,
-        message_ids: None,
         pq_public_key: None,
         pq_ciphertext: None,
         sig: None,

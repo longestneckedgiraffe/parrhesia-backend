@@ -13,8 +13,6 @@ pub struct RoomMessage {
     pub target_conn_id: Option<String>,
     pub payload: String,
     pub msg_type: MessageType,
-    pub message_id: Option<String>,
-    pub message_ids: Option<Vec<String>>,
     pub pq_public_key: Option<String>,
     pub pq_ciphertext: Option<String>,
     pub sig: Option<String>,
@@ -32,7 +30,6 @@ pub enum MessageType {
     PeerLeft,
     RoomExpired,
     Typing,
-    Read,
 }
 
 #[derive(Clone)]
@@ -79,8 +76,6 @@ impl AppState {
                     target_conn_id: None,
                     payload: String::new(),
                     msg_type: MessageType::RoomExpired,
-                    message_id: None,
-                    message_ids: None,
                     pq_public_key: None,
                     pq_ciphertext: None,
                     sig: None,
