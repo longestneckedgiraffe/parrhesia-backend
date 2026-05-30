@@ -31,3 +31,28 @@ impl Config {
         (self.inactivity_expiry_hours * 3600) as i64
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_expiry(hours: u64) -> Config {
+        Config {
+            database_url: String::new(),
+            port: 0,
+            inactivity_expiry_hours: hours,
+            cleanup_interval_mins: 5,
+        }
+    }
+
+    #[test]
+    fn expiry_hours_convert_to_seconds() {
+        assert_eq!(config_with_expiry(24).inactivity_expiry_secs(), 86_400);
+        assert_eq!(config_with_expiry(1).inactivity_expiry_secs(), 3_600);
+    }
+
+    #[test]
+    fn zero_hours_is_zero_seconds() {
+        assert_eq!(config_with_expiry(0).inactivity_expiry_secs(), 0);
+    }
+}

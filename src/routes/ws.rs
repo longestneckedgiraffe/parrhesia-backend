@@ -279,6 +279,56 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state, room_id))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ML-DSA-65 public keys are 1952 bytes; ML-KEM-768 are 1184 bytes.
+    fn key_of_len(len: usize) -> String {
+        STANDARD.encode(vec![0u8; len])
+    }
+
+    #[test]
+    fn accepts_correctly_sized_mldsa65_key() {
+        assert!(is_valid_mldsa65_public_key(&key_of_len(1952)));
+    }
+
+    #[test]
+    fn rejects_wrong_length_mldsa65_key() {
+        assert!(!is_valid_mldsa65_public_key(&key_of_len(1951)));
+        assert!(!is_valid_mldsa65_public_key(&key_of_len(1953)));
+        assert!(!is_valid_mldsa65_public_key(&key_of_len(0)));
+    }
+
+    #[test]
+    fn rejects_non_base64_mldsa65_key() {
+        assert!(!is_valid_mldsa65_public_key("not valid base64!!!"));
+    }
+
+    #[test]
+    fn accepts_correctly_sized_mlkem768_key() {
+        assert!(is_valid_mlkem768_public_key(&key_of_len(1184)));
+    }
+
+    #[test]
+    fn rejects_wrong_length_mlkem768_key() {
+        assert!(!is_valid_mlkem768_public_key(&key_of_len(1183)));
+        assert!(!is_valid_mlkem768_public_key(&key_of_len(1185)));
+    }
+
+    #[test]
+    fn rejects_non_base64_mlkem768_key() {
+        assert!(!is_valid_mlkem768_public_key("@@@not-base64@@@"));
+    }
+
+    // A key sized for one algorithm must never be accepted as the other.
+    #[test]
+    fn does_not_confuse_the_two_key_types() {
+        assert!(!is_valid_mlkem768_public_key(&key_of_len(1952)));
+        assert!(!is_valid_mldsa65_public_key(&key_of_len(1184)));
+    }
+}
+
 async fn send_json<T: Serialize>(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     msg: &T,
