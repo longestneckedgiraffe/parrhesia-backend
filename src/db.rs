@@ -7,6 +7,12 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .connect(database_url)
         .await?;
 
+    run_migrations(&pool).await?;
+
+    Ok(pool)
+}
+
+async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS rooms (
@@ -17,11 +23,11 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         )
         "#,
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     let _ = sqlx::query("ALTER TABLE rooms ADD COLUMN creator_id TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
 
     sqlx::query(
@@ -36,14 +42,14 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         )
         "#,
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     let _ = sqlx::query("ALTER TABLE participants ADD COLUMN sig TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
 
-    Ok(pool)
+    Ok(())
 }
 
 fn now_timestamp() -> i64 {
@@ -239,5 +245,171 @@ pub async fn reset_creator_if_empty(pool: &SqlitePool, room_id: &str) -> Result<
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A fresh, isolated in-memory database per test. `max_connections(1)` keeps
+    // every query on the same connection, so the `:memory:` database persists
+    // for the lifetime of the pool instead of being recreated per acquire.
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory database");
+        run_migrations(&pool)
+            .await
+            .expect("failed to run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    async fn create_and_check_room() {
+        let pool = test_pool().await;
+
+        assert!(!room_exists(&pool, "room1").await.unwrap());
+        create_room(&pool, "room1").await.unwrap();
+        assert!(room_exists(&pool, "room1").await.unwrap());
+        assert!(!room_exists(&pool, "missing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn participant_cap_is_enforced_per_room() {
+        let pool = test_pool().await;
+        create_room(&pool, "a").await.unwrap();
+        create_room(&pool, "b").await.unwrap();
+
+        // Cap of 2 in room "a": the first two succeed, the third is rejected.
+        assert!(try_add_participant(&pool, "p1", "a", "k1", "pq1", None, 2).await.unwrap());
+        assert!(try_add_participant(&pool, "p2", "a", "k2", "pq2", None, 2).await.unwrap());
+        assert!(!try_add_participant(&pool, "p3", "a", "k3", "pq3", None, 2).await.unwrap());
+        assert_eq!(count_participants(&pool, "a").await.unwrap(), 2);
+
+        // The cap is per-room: a full room "a" must not block room "b".
+        assert!(try_add_participant(&pool, "p4", "b", "k4", "pq4", None, 2).await.unwrap());
+        assert_eq!(count_participants(&pool, "b").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn first_connection_becomes_creator() {
+        let pool = test_pool().await;
+        create_room(&pool, "r").await.unwrap();
+
+        assert!(set_creator(&pool, "r", "first").await.unwrap());
+        // A later connection must not overwrite the existing creator.
+        assert!(!set_creator(&pool, "r", "second").await.unwrap());
+        assert_eq!(
+            get_creator(&pool, "r").await.unwrap(),
+            Some("first".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_creator_only_when_room_is_empty() {
+        let pool = test_pool().await;
+        create_room(&pool, "r").await.unwrap();
+        set_creator(&pool, "r", "owner").await.unwrap();
+        try_add_participant(&pool, "owner", "r", "k", "pq", None, 16).await.unwrap();
+
+        // Still occupied -> no reset.
+        assert!(!reset_creator_if_empty(&pool, "r").await.unwrap());
+        assert_eq!(
+            get_creator(&pool, "r").await.unwrap(),
+            Some("owner".to_string())
+        );
+
+        // Now empty -> creator is cleared so the next joiner can claim it.
+        remove_participant(&pool, "owner").await.unwrap();
+        assert!(reset_creator_if_empty(&pool, "r").await.unwrap());
+        assert_eq!(get_creator(&pool, "r").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn get_other_public_keys_excludes_self() {
+        let pool = test_pool().await;
+        create_room(&pool, "r").await.unwrap();
+        try_add_participant(&pool, "me", "r", "mykey", "mypq", None, 16).await.unwrap();
+        try_add_participant(&pool, "peer", "r", "peerkey", "peerpq", Some("peersig"), 16)
+            .await
+            .unwrap();
+
+        let others = get_other_public_keys(&pool, "r", "me").await.unwrap();
+        assert_eq!(others.len(), 1);
+        let (id, key, pq, sig) = &others[0];
+        assert_eq!(id, "peer");
+        assert_eq!(key, "peerkey");
+        assert_eq!(pq, "peerpq");
+        assert_eq!(sig.as_deref(), Some("peersig"));
+    }
+
+    #[tokio::test]
+    async fn remove_room_participants_clears_only_that_room() {
+        let pool = test_pool().await;
+        create_room(&pool, "r").await.unwrap();
+        create_room(&pool, "other").await.unwrap();
+        try_add_participant(&pool, "p1", "r", "k1", "pq1", None, 16).await.unwrap();
+        try_add_participant(&pool, "p2", "r", "k2", "pq2", None, 16).await.unwrap();
+        try_add_participant(&pool, "p3", "other", "k3", "pq3", None, 16).await.unwrap();
+
+        remove_room_participants(&pool, "r").await.unwrap();
+        assert_eq!(count_participants(&pool, "r").await.unwrap(), 0);
+        assert_eq!(count_participants(&pool, "other").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_inactive_rooms_targets_only_stale_rooms() {
+        let pool = test_pool().await;
+        create_room(&pool, "stale").await.unwrap();
+        create_room(&pool, "fresh").await.unwrap();
+
+        // Backdate the stale room well beyond any threshold.
+        sqlx::query("UPDATE rooms SET last_activity = 0 WHERE id = ?")
+            .bind("stale")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let deleted = delete_inactive_rooms(&pool, 3600).await.unwrap();
+        assert_eq!(deleted, vec!["stale".to_string()]);
+        assert!(!room_exists(&pool, "stale").await.unwrap());
+        assert!(room_exists(&pool, "fresh").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn update_activity_refreshes_timestamp() {
+        let pool = test_pool().await;
+        create_room(&pool, "r").await.unwrap();
+        sqlx::query("UPDATE rooms SET last_activity = 0 WHERE id = ?")
+            .bind("r")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        update_activity(&pool, "r").await.unwrap();
+
+        let (last_activity,): (i64,) =
+            sqlx::query_as("SELECT last_activity FROM rooms WHERE id = ?")
+                .bind("r")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(last_activity > 0);
+    }
+
+    #[tokio::test]
+    async fn store_public_key_replaces_existing_row() {
+        let pool = test_pool().await;
+        create_room(&pool, "r").await.unwrap();
+        store_public_key(&pool, "p", "r", "first").await.unwrap();
+        store_public_key(&pool, "p", "r", "second").await.unwrap();
+
+        // INSERT OR REPLACE must keep a single row holding the latest key.
+        assert_eq!(count_participants(&pool, "r").await.unwrap(), 1);
+        let others = get_other_public_keys(&pool, "r", "someone-else").await.unwrap();
+        assert_eq!(others[0].1, "second");
     }
 }
