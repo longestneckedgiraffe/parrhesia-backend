@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use uuid::Uuid;
 
 use crate::db;
@@ -32,6 +32,59 @@ fn is_valid_mlkem768_public_key(base64_key: &str) -> bool {
 const MAX_PARTICIPANTS: i64 = 16;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
+// A client must complete the key-exchange handshake within this window, or the
+// socket is dropped. The heartbeat only starts afterwards, so without this a
+// connection could sit idle in the handshake forever (Cloudflare's WS proxy
+// sees a healthy connection and won't reap it).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Largest inbound WebSocket message we accept. Parrhesia relays text only, so
+// this is generous; it exists to close the 16-way broadcast amplifier (the
+// library default is 64 MiB). Oversized frames cause the socket to error+close.
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+// Per-connection inbound budget: 30 messages/sec sustained, bursts up to 60.
+// No human (even keystroke-rate typing indicators) approaches this; it caps a
+// flooding peer. Cloudflare handles volumetric/edge DoS — this is the per-frame
+// budget it has no visibility into.
+const MSG_RATE_CAPACITY: f64 = 60.0;
+const MSG_RATE_REFILL_PER_SEC: f64 = 30.0;
+
+/// Per-connection token bucket guarding how many inbound frames a single socket
+/// can have relayed. Refills continuously at `refill_per_sec`, capped at
+/// `capacity`. `check` is the only mutator; time is injected so it stays unit-testable.
+struct RateLimiter {
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self {
+            tokens: capacity,
+            capacity,
+            refill_per_sec,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refills based on elapsed time, then tries to spend one token. Returns
+    /// false (caller should drop the message) when the bucket is empty.
+    fn check(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct IncomingMessage {
@@ -276,7 +329,9 @@ pub async fn ws_handler(
     State(state): State<AppState>,
     Path(room_id): Path<String>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, room_id))
+    ws.max_message_size(MAX_MESSAGE_BYTES)
+        .max_frame_size(MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, room_id))
 }
 
 #[cfg(test)]
@@ -326,6 +381,41 @@ mod tests {
     fn does_not_confuse_the_two_key_types() {
         assert!(!is_valid_mlkem768_public_key(&key_of_len(1952)));
         assert!(!is_valid_mldsa65_public_key(&key_of_len(1184)));
+    }
+
+    #[test]
+    fn rate_limiter_allows_burst_up_to_capacity() {
+        let t0 = Instant::now();
+        let mut rl = RateLimiter::new(3.0, 1.0);
+        // The full capacity is available immediately, with no time elapsed.
+        assert!(rl.check(t0));
+        assert!(rl.check(t0));
+        assert!(rl.check(t0));
+        // Bucket now empty -> the next frame is dropped.
+        assert!(!rl.check(t0));
+    }
+
+    #[test]
+    fn rate_limiter_refills_over_time() {
+        let t0 = Instant::now();
+        let mut rl = RateLimiter::new(2.0, 1.0);
+        assert!(rl.check(t0));
+        assert!(rl.check(t0));
+        assert!(!rl.check(t0));
+        // One second later, exactly one token has refilled.
+        assert!(rl.check(t0 + Duration::from_secs(1)));
+        assert!(!rl.check(t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn rate_limiter_caps_at_capacity() {
+        let t0 = Instant::now();
+        let mut rl = RateLimiter::new(2.0, 100.0);
+        // After a long idle, tokens must saturate at capacity, not accumulate.
+        let later = t0 + Duration::from_secs(10);
+        assert!(rl.check(later));
+        assert!(rl.check(later));
+        assert!(!rl.check(later));
     }
 }
 
@@ -388,39 +478,51 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         return;
     }
 
-    let (public_key, pq_public_key, announce_sig) = loop {
-        match ws_receiver.next().await {
-            Some(Ok(Message::Text(text))) => {
-                if let Ok(msg) = serde_json::from_str::<IncomingMessage>(&text) {
-                    if msg.msg_type == "key_announce" {
-                        if let Some(key) = msg.public_key {
-                            if !is_valid_mldsa65_public_key(&key) {
-                                tracing::warn!("Invalid public key format from {}", conn_id);
-                                return;
-                            }
-                            match msg.pq_public_key {
-                                Some(pq_key) if is_valid_mlkem768_public_key(&pq_key) => {
-                                    break (key, pq_key, msg.sig);
+    let handshake = timeout(HANDSHAKE_TIMEOUT, async {
+        loop {
+            match ws_receiver.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(msg) = serde_json::from_str::<IncomingMessage>(&text) {
+                        if msg.msg_type == "key_announce" {
+                            if let Some(key) = msg.public_key {
+                                if !is_valid_mldsa65_public_key(&key) {
+                                    tracing::warn!("Invalid public key format from {}", conn_id);
+                                    return None;
                                 }
-                                _ => {
-                                    tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
-                                    return;
+                                match msg.pq_public_key {
+                                    Some(pq_key) if is_valid_mlkem768_public_key(&pq_key) => {
+                                        return Some((key, pq_key, msg.sig));
+                                    }
+                                    _ => {
+                                        tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
+                                        return None;
+                                    }
                                 }
                             }
                         }
                     }
+                    tracing::warn!("Expected key_announce, got: {}", text);
                 }
-                tracing::warn!("Expected key_announce, got: {}", text);
+                Some(Ok(Message::Close(_))) | None => {
+                    tracing::info!("Client disconnected before key exchange: {}", conn_id);
+                    return None;
+                }
+                Some(Err(e)) => {
+                    tracing::error!("WebSocket error during key exchange: {}", e);
+                    return None;
+                }
+                _ => continue,
             }
-            Some(Ok(Message::Close(_))) | None => {
-                tracing::info!("Client disconnected before key exchange: {}", conn_id);
-                return;
-            }
-            Some(Err(e)) => {
-                tracing::error!("WebSocket error during key exchange: {}", e);
-                return;
-            }
-            _ => continue,
+        }
+    })
+    .await;
+
+    let (public_key, pq_public_key, announce_sig) = match handshake {
+        Ok(Some(keys)) => keys,
+        Ok(None) => return,
+        Err(_) => {
+            tracing::warn!("Key-exchange handshake timed out for {}", conn_id);
+            return;
         }
     };
 
@@ -487,6 +589,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
     let mut ping_interval = interval(PING_INTERVAL);
     let mut last_pong = Instant::now();
     let mut waiting_for_pong = false;
+    let mut rate_limiter = RateLimiter::new(MSG_RATE_CAPACITY, MSG_RATE_REFILL_PER_SEC);
 
     loop {
         tokio::select! {
@@ -544,6 +647,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
             msg = ws_receiver.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        if !rate_limiter.check(Instant::now()) {
+                            tracing::debug!("Rate limit exceeded for {}, dropping message", conn_id);
+                            continue;
+                        }
+
                         let incoming: IncomingMessage = match serde_json::from_str(&text) {
                             Ok(m) => m,
                             Err(_) => {
