@@ -16,3 +16,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 http = "1"
 base64 = "0.22"
+
+[dev-dependencies]
+# Real WebSocket client for the end-to-end lifecycle tests. Pinned to the same
+# major version axum already pulls in, so the dependency tree stays single-copy.
+tokio-tungstenite = "0.24"
