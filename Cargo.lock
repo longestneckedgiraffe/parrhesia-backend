@@ -966,6 +966,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-tungstenite",
  "tower-http",
  "tracing",
  "tracing-subscriber",
