@@ -334,97 +334,12 @@ pub async fn ws_handler(
         .on_upgrade(move |socket| handle_socket(socket, state, room_id))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ML-DSA-65 public keys are 1952 bytes; ML-KEM-768 are 1184 bytes.
-    fn key_of_len(len: usize) -> String {
-        STANDARD.encode(vec![0u8; len])
-    }
-
-    #[test]
-    fn accepts_correctly_sized_mldsa65_key() {
-        assert!(is_valid_mldsa65_public_key(&key_of_len(1952)));
-    }
-
-    #[test]
-    fn rejects_wrong_length_mldsa65_key() {
-        assert!(!is_valid_mldsa65_public_key(&key_of_len(1951)));
-        assert!(!is_valid_mldsa65_public_key(&key_of_len(1953)));
-        assert!(!is_valid_mldsa65_public_key(&key_of_len(0)));
-    }
-
-    #[test]
-    fn rejects_non_base64_mldsa65_key() {
-        assert!(!is_valid_mldsa65_public_key("not valid base64!!!"));
-    }
-
-    #[test]
-    fn accepts_correctly_sized_mlkem768_key() {
-        assert!(is_valid_mlkem768_public_key(&key_of_len(1184)));
-    }
-
-    #[test]
-    fn rejects_wrong_length_mlkem768_key() {
-        assert!(!is_valid_mlkem768_public_key(&key_of_len(1183)));
-        assert!(!is_valid_mlkem768_public_key(&key_of_len(1185)));
-    }
-
-    #[test]
-    fn rejects_non_base64_mlkem768_key() {
-        assert!(!is_valid_mlkem768_public_key("@@@not-base64@@@"));
-    }
-
-    // A key sized for one algorithm must never be accepted as the other.
-    #[test]
-    fn does_not_confuse_the_two_key_types() {
-        assert!(!is_valid_mlkem768_public_key(&key_of_len(1952)));
-        assert!(!is_valid_mldsa65_public_key(&key_of_len(1184)));
-    }
-
-    #[test]
-    fn rate_limiter_allows_burst_up_to_capacity() {
-        let t0 = Instant::now();
-        let mut rl = RateLimiter::new(3.0, 1.0);
-        // The full capacity is available immediately, with no time elapsed.
-        assert!(rl.check(t0));
-        assert!(rl.check(t0));
-        assert!(rl.check(t0));
-        // Bucket now empty -> the next frame is dropped.
-        assert!(!rl.check(t0));
-    }
-
-    #[test]
-    fn rate_limiter_refills_over_time() {
-        let t0 = Instant::now();
-        let mut rl = RateLimiter::new(2.0, 1.0);
-        assert!(rl.check(t0));
-        assert!(rl.check(t0));
-        assert!(!rl.check(t0));
-        // One second later, exactly one token has refilled.
-        assert!(rl.check(t0 + Duration::from_secs(1)));
-        assert!(!rl.check(t0 + Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn rate_limiter_caps_at_capacity() {
-        let t0 = Instant::now();
-        let mut rl = RateLimiter::new(2.0, 100.0);
-        // After a long idle, tokens must saturate at capacity, not accumulate.
-        let later = t0 + Duration::from_secs(10);
-        assert!(rl.check(later));
-        assert!(rl.check(later));
-        assert!(!rl.check(later));
-    }
-}
-
 async fn send_json<T: Serialize>(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     msg: &T,
 ) -> bool {
     match serde_json::to_string(msg) {
-        Ok(json) => sender.send(Message::Text(json.into())).await.is_ok(),
+        Ok(json) => sender.send(Message::Text(json)).await.is_ok(),
         Err(_) => false,
     }
 }
@@ -482,22 +397,21 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         loop {
             match ws_receiver.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    if let Ok(msg) = serde_json::from_str::<IncomingMessage>(&text) {
-                        if msg.msg_type == "key_announce" {
-                            if let Some(key) = msg.public_key {
-                                if !is_valid_mldsa65_public_key(&key) {
-                                    tracing::warn!("Invalid public key format from {}", conn_id);
-                                    return None;
-                                }
-                                match msg.pq_public_key {
-                                    Some(pq_key) if is_valid_mlkem768_public_key(&pq_key) => {
-                                        return Some((key, pq_key, msg.sig));
-                                    }
-                                    _ => {
-                                        tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
-                                        return None;
-                                    }
-                                }
+                    if let Ok(msg) = serde_json::from_str::<IncomingMessage>(&text)
+                        && msg.msg_type == "key_announce"
+                        && let Some(key) = msg.public_key
+                    {
+                        if !is_valid_mldsa65_public_key(&key) {
+                            tracing::warn!("Invalid public key format from {}", conn_id);
+                            return None;
+                        }
+                        match msg.pq_public_key {
+                            Some(pq_key) if is_valid_mlkem768_public_key(&pq_key) => {
+                                return Some((key, pq_key, msg.sig));
+                            }
+                            _ => {
+                                tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
+                                return None;
                             }
                         }
                     }
@@ -599,7 +513,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                     break;
                 }
 
-                if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
+                if ws_sender.send(Message::Ping(vec![])).await.is_err() {
                     tracing::error!("Failed to send ping to {}", conn_id);
                     break;
                 }
@@ -613,10 +527,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                             continue;
                         }
 
-                        if let Some(ref target) = room_msg.target_conn_id {
-                            if target != &conn_id {
-                                continue;
-                            }
+                        if let Some(ref target) = room_msg.target_conn_id
+                            && target != &conn_id
+                        {
+                            continue;
                         }
 
                         let outgoing = match room_msg.msg_type {
@@ -629,10 +543,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                             MessageType::RoomExpired => OutgoingMessage::room_expired(),
                         };
 
-                        if let Ok(json) = serde_json::to_string(&outgoing) {
-                            if ws_sender.send(Message::Text(json.into())).await.is_err() {
-                                break;
-                            }
+                        if let Ok(json) = serde_json::to_string(&outgoing)
+                            && ws_sender.send(Message::Text(json)).await.is_err()
+                        {
+                            break;
                         }
 
                         if matches!(room_msg.msg_type, MessageType::RoomExpired) {
@@ -782,4 +696,89 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
     });
 
     tracing::info!("Connection {} disconnected from room {}", conn_id, room_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ML-DSA-65 public keys are 1952 bytes; ML-KEM-768 are 1184 bytes.
+    fn key_of_len(len: usize) -> String {
+        STANDARD.encode(vec![0u8; len])
+    }
+
+    #[test]
+    fn accepts_correctly_sized_mldsa65_key() {
+        assert!(is_valid_mldsa65_public_key(&key_of_len(1952)));
+    }
+
+    #[test]
+    fn rejects_wrong_length_mldsa65_key() {
+        assert!(!is_valid_mldsa65_public_key(&key_of_len(1951)));
+        assert!(!is_valid_mldsa65_public_key(&key_of_len(1953)));
+        assert!(!is_valid_mldsa65_public_key(&key_of_len(0)));
+    }
+
+    #[test]
+    fn rejects_non_base64_mldsa65_key() {
+        assert!(!is_valid_mldsa65_public_key("not valid base64!!!"));
+    }
+
+    #[test]
+    fn accepts_correctly_sized_mlkem768_key() {
+        assert!(is_valid_mlkem768_public_key(&key_of_len(1184)));
+    }
+
+    #[test]
+    fn rejects_wrong_length_mlkem768_key() {
+        assert!(!is_valid_mlkem768_public_key(&key_of_len(1183)));
+        assert!(!is_valid_mlkem768_public_key(&key_of_len(1185)));
+    }
+
+    #[test]
+    fn rejects_non_base64_mlkem768_key() {
+        assert!(!is_valid_mlkem768_public_key("@@@not-base64@@@"));
+    }
+
+    // A key sized for one algorithm must never be accepted as the other.
+    #[test]
+    fn does_not_confuse_the_two_key_types() {
+        assert!(!is_valid_mlkem768_public_key(&key_of_len(1952)));
+        assert!(!is_valid_mldsa65_public_key(&key_of_len(1184)));
+    }
+
+    #[test]
+    fn rate_limiter_allows_burst_up_to_capacity() {
+        let t0 = Instant::now();
+        let mut rl = RateLimiter::new(3.0, 1.0);
+        // The full capacity is available immediately, with no time elapsed.
+        assert!(rl.check(t0));
+        assert!(rl.check(t0));
+        assert!(rl.check(t0));
+        // Bucket now empty -> the next frame is dropped.
+        assert!(!rl.check(t0));
+    }
+
+    #[test]
+    fn rate_limiter_refills_over_time() {
+        let t0 = Instant::now();
+        let mut rl = RateLimiter::new(2.0, 1.0);
+        assert!(rl.check(t0));
+        assert!(rl.check(t0));
+        assert!(!rl.check(t0));
+        // One second later, exactly one token has refilled.
+        assert!(rl.check(t0 + Duration::from_secs(1)));
+        assert!(!rl.check(t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn rate_limiter_caps_at_capacity() {
+        let t0 = Instant::now();
+        let mut rl = RateLimiter::new(2.0, 100.0);
+        // After a long idle, tokens must saturate at capacity, not accumulate.
+        let later = t0 + Duration::from_secs(10);
+        assert!(rl.check(later));
+        assert!(rl.check(later));
+        assert!(!rl.check(later));
+    }
 }
