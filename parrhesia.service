@@ -1,5 +1,5 @@
 [Unit]
-Description=a very basic e2ee chatting service
+Description=A very basic E2EE chatting service
 After=network.target
 
 [Service]
