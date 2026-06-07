@@ -1,0 +1,1 @@
+parrhesia ALL=(root) NOPASSWD: /usr/bin/systemctl restart parrhesia, /usr/bin/systemctl start parrhesia, /usr/bin/systemctl stop parrhesia
