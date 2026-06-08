@@ -29,6 +29,7 @@ fn is_valid_mlkem768_public_key(base64_key: &str) -> bool {
     }
 }
 
+const PROTOCOL_VERSION: u32 = 1;
 const MAX_PARTICIPANTS: i64 = 16;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
@@ -124,6 +125,7 @@ enum IncomingMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutgoingMessage {
     Welcome {
+        protocol_version: u32,
         peer_id: String,
         is_creator: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,6 +271,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
     if !send_json(
         &mut ws_sender,
         &OutgoingMessage::Welcome {
+            protocol_version: PROTOCOL_VERSION,
             peer_id: conn_id.clone(),
             is_creator,
             creator_id: creator_id.clone(),
@@ -631,6 +634,7 @@ mod tests {
     #[test]
     fn welcome_serializes_with_creator() {
         let json = serde_json::to_string(&OutgoingMessage::Welcome {
+            protocol_version: PROTOCOL_VERSION,
             peer_id: "p1".to_string(),
             is_creator: true,
             creator_id: Some("c1".to_string()),
@@ -638,19 +642,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"type":"welcome","peer_id":"p1","is_creator":true,"creator_id":"c1"}"#
+            r#"{"type":"welcome","protocol_version":1,"peer_id":"p1","is_creator":true,"creator_id":"c1"}"#
         );
     }
 
     #[test]
     fn welcome_omits_creator_when_absent() {
         let json = serde_json::to_string(&OutgoingMessage::Welcome {
+            protocol_version: PROTOCOL_VERSION,
             peer_id: "p1".to_string(),
             is_creator: false,
             creator_id: None,
         })
         .unwrap();
-        assert_eq!(json, r#"{"type":"welcome","peer_id":"p1","is_creator":false}"#);
+        assert_eq!(
+            json,
+            r#"{"type":"welcome","protocol_version":1,"peer_id":"p1","is_creator":false}"#
+        );
     }
 
     #[test]
