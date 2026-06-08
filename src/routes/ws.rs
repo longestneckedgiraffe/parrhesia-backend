@@ -13,7 +13,7 @@ use tokio::time::{interval, timeout};
 use uuid::Uuid;
 
 use crate::db;
-use crate::state::{AppState, MessageType, RoomMessage};
+use crate::state::{AppState, RoomEvent};
 
 fn is_valid_mldsa65_public_key(base64_key: &str) -> bool {
     match STANDARD.decode(base64_key) {
@@ -87,239 +87,122 @@ impl RateLimiter {
 }
 
 #[derive(Deserialize)]
-struct IncomingMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    #[serde(default)]
-    public_key: Option<String>,
-    #[serde(default)]
-    payload: Option<String>,
-    #[serde(default)]
-    target_peer_id: Option<String>,
-    #[serde(default)]
-    pq_public_key: Option<String>,
-    #[serde(default)]
-    pq_ciphertext: Option<String>,
-    #[serde(default)]
-    sig: Option<String>,
-    #[serde(default)]
-    epoch: Option<u64>,
-    #[serde(default)]
-    counter: Option<u64>,
-    #[serde(default)]
-    tree_commit: Option<String>,
-    #[serde(default)]
-    tree_welcome: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum IncomingMessage {
+    KeyAnnounce {
+        #[serde(default)]
+        public_key: Option<String>,
+        #[serde(default)]
+        pq_public_key: Option<String>,
+        #[serde(default)]
+        sig: Option<String>,
+    },
+    Message {
+        #[serde(default)]
+        payload: Option<String>,
+        #[serde(default)]
+        epoch: Option<u64>,
+        #[serde(default)]
+        counter: Option<u64>,
+    },
+    TreeCommit {
+        #[serde(default)]
+        tree_commit: Option<String>,
+    },
+    TreeWelcome {
+        #[serde(default)]
+        tree_welcome: Option<String>,
+        #[serde(default)]
+        target_peer_id: Option<String>,
+    },
+    Typing,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Serialize)]
-struct OutgoingMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    peer_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    public_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    payload: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    is_creator: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    creator_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pq_public_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pq_ciphertext: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sig: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    epoch: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    counter: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tree_commit: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tree_welcome: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OutgoingMessage {
+    Welcome {
+        peer_id: String,
+        is_creator: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        creator_id: Option<String>,
+    },
+    PeerKey {
+        peer_id: String,
+        public_key: String,
+        pq_public_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sig: Option<String>,
+    },
+    PeerJoined {
+        peer_id: String,
+        public_key: String,
+        pq_public_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sig: Option<String>,
+    },
+    PeerLeft {
+        peer_id: String,
+    },
+    Message {
+        peer_id: String,
+        payload: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        epoch: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        counter: Option<u64>,
+    },
+    TreeCommit {
+        peer_id: String,
+        tree_commit: String,
+    },
+    Typing {
+        peer_id: String,
+    },
+    RoomExpired,
+    TreeWelcome {
+        tree_welcome: String,
+    },
+    RoomFull,
 }
 
-impl OutgoingMessage {
-    fn welcome(peer_id: &str, is_creator: bool, creator_id: Option<&str>) -> Self {
-        Self {
-            msg_type: "welcome".to_string(),
-            peer_id: Some(peer_id.to_string()),
-            public_key: None,
-            payload: None,
-            is_creator: Some(is_creator),
-            creator_id: creator_id.map(|s| s.to_string()),
-            pq_public_key: None,
-            pq_ciphertext: None,
-            sig: None,
-            epoch: None,
-            counter: None,
-            tree_commit: None,
-            tree_welcome: None,
-        }
-    }
-
-    fn peer_key(peer_id: &str, public_key: &str, pq_public_key: &str, sig: Option<&str>) -> Self {
-        Self {
-            msg_type: "peer_key".to_string(),
-            peer_id: Some(peer_id.to_string()),
-            public_key: Some(public_key.to_string()),
-            payload: None,
-            is_creator: None,
-            creator_id: None,
-            pq_public_key: Some(pq_public_key.to_string()),
-            pq_ciphertext: None,
-            sig: sig.map(|s| s.to_string()),
-            epoch: None,
-            counter: None,
-            tree_commit: None,
-            tree_welcome: None,
-        }
-    }
-
-    fn peer_joined(peer_id: &str, public_key: &str, pq_public_key: &str, sig: Option<&str>) -> Self {
-        Self {
-            msg_type: "peer_joined".to_string(),
-            peer_id: Some(peer_id.to_string()),
-            public_key: Some(public_key.to_string()),
-            payload: None,
-            is_creator: None,
-            creator_id: None,
-            pq_public_key: Some(pq_public_key.to_string()),
-            pq_ciphertext: None,
-            sig: sig.map(|s| s.to_string()),
-            epoch: None,
-            counter: None,
-            tree_commit: None,
-            tree_welcome: None,
-        }
-    }
-
-    fn peer_left(peer_id: &str) -> Self {
-        Self {
-            msg_type: "peer_left".to_string(),
-            peer_id: Some(peer_id.to_string()),
-            public_key: None,
-            payload: None,
-            is_creator: None,
-            creator_id: None,
-            pq_public_key: None,
-            pq_ciphertext: None,
-            sig: None,
-            epoch: None,
-            counter: None,
-            tree_commit: None,
-            tree_welcome: None,
-        }
-    }
-
-    fn chat(peer_id: &str, payload: &str, epoch: Option<u64>, counter: Option<u64>) -> Self {
-        Self {
-            msg_type: "message".to_string(),
-            peer_id: Some(peer_id.to_string()),
-            public_key: None,
-            payload: Some(payload.to_string()),
-            is_creator: None,
-            creator_id: None,
-            pq_public_key: None,
-            pq_ciphertext: None,
-            sig: None,
-            epoch,
-            counter,
-            tree_commit: None,
-            tree_welcome: None,
-        }
-    }
-
-    fn tree_commit(peer_id: &str, tree_commit: &str) -> Self {
-        Self {
-            msg_type: "tree_commit".to_string(),
-            peer_id: Some(peer_id.to_string()),
-            public_key: None,
-            payload: None,
-            is_creator: None,
-            creator_id: None,
-            pq_public_key: None,
-            pq_ciphertext: None,
-            sig: None,
-            epoch: None,
-            counter: None,
-            tree_commit: Some(tree_commit.to_string()),
-            tree_welcome: None,
-        }
-    }
-
-    fn typing(peer_id: &str) -> Self {
-        Self {
-            msg_type: "typing".to_string(),
-            peer_id: Some(peer_id.to_string()),
-            public_key: None,
-            payload: None,
-            is_creator: None,
-            creator_id: None,
-            pq_public_key: None,
-            pq_ciphertext: None,
-            sig: None,
-            epoch: None,
-            counter: None,
-            tree_commit: None,
-            tree_welcome: None,
-        }
-    }
-
-    fn room_expired() -> Self {
-        Self {
-            msg_type: "room_expired".to_string(),
-            peer_id: None,
-            public_key: None,
-            payload: None,
-            is_creator: None,
-            creator_id: None,
-            pq_public_key: None,
-            pq_ciphertext: None,
-            sig: None,
-            epoch: None,
-            counter: None,
-            tree_commit: None,
-            tree_welcome: None,
-        }
-    }
-
-    fn tree_welcome(tree_welcome: &str) -> Self {
-        Self {
-            msg_type: "tree_welcome".to_string(),
-            peer_id: None,
-            public_key: None,
-            payload: None,
-            is_creator: None,
-            creator_id: None,
-            pq_public_key: None,
-            pq_ciphertext: None,
-            sig: None,
-            epoch: None,
-            counter: None,
-            tree_commit: None,
-            tree_welcome: Some(tree_welcome.to_string()),
-        }
-    }
-
-    fn room_full() -> Self {
-        Self {
-            msg_type: "room_full".to_string(),
-            peer_id: None,
-            public_key: None,
-            payload: None,
-            is_creator: None,
-            creator_id: None,
-            pq_public_key: None,
-            pq_ciphertext: None,
-            sig: None,
-            epoch: None,
-            counter: None,
-            tree_commit: None,
-            tree_welcome: None,
+impl From<RoomEvent> for OutgoingMessage {
+    fn from(event: RoomEvent) -> Self {
+        match event {
+            RoomEvent::Chat {
+                from,
+                payload,
+                epoch,
+                counter,
+            } => OutgoingMessage::Message {
+                peer_id: from,
+                payload,
+                epoch,
+                counter,
+            },
+            RoomEvent::TreeCommit { from, tree_data } => OutgoingMessage::TreeCommit {
+                peer_id: from,
+                tree_commit: tree_data,
+            },
+            RoomEvent::TreeWelcome { tree_data, .. } => OutgoingMessage::TreeWelcome {
+                tree_welcome: tree_data,
+            },
+            RoomEvent::PeerJoined {
+                from,
+                public_key,
+                pq_public_key,
+                sig,
+            } => OutgoingMessage::PeerJoined {
+                peer_id: from,
+                public_key,
+                pq_public_key,
+                sig,
+            },
+            RoomEvent::PeerLeft { from } => OutgoingMessage::PeerLeft { peer_id: from },
+            RoomEvent::Typing { from } => OutgoingMessage::Typing { peer_id: from },
+            RoomEvent::RoomExpired => OutgoingMessage::RoomExpired,
         }
     }
 }
@@ -385,7 +268,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
 
     if !send_json(
         &mut ws_sender,
-        &OutgoingMessage::welcome(&conn_id, is_creator, creator_id.as_deref()),
+        &OutgoingMessage::Welcome {
+            peer_id: conn_id.clone(),
+            is_creator,
+            creator_id: creator_id.clone(),
+        },
     )
     .await
     {
@@ -397,17 +284,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         loop {
             match ws_receiver.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    if let Ok(msg) = serde_json::from_str::<IncomingMessage>(&text)
-                        && msg.msg_type == "key_announce"
-                        && let Some(key) = msg.public_key
+                    if let Ok(IncomingMessage::KeyAnnounce {
+                        public_key: Some(key),
+                        pq_public_key,
+                        sig,
+                    }) = serde_json::from_str::<IncomingMessage>(&text)
                     {
                         if !is_valid_mldsa65_public_key(&key) {
                             tracing::warn!("Invalid public key format from {}", conn_id);
                             return None;
                         }
-                        match msg.pq_public_key {
+                        match pq_public_key {
                             Some(pq_key) if is_valid_mlkem768_public_key(&pq_key) => {
-                                return Some((key, pq_key, msg.sig));
+                                return Some((key, pq_key, sig));
                             }
                             _ => {
                                 tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
@@ -462,14 +351,23 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
 
     if !added {
         tracing::warn!("Room {} is full", room_id);
-        let _ = send_json(&mut ws_sender, &OutgoingMessage::room_full()).await;
+        let _ = send_json(&mut ws_sender, &OutgoingMessage::RoomFull).await;
         return;
     }
 
     match db::get_other_public_keys(&state.db, &room_id, &conn_id).await {
         Ok(peers) => {
             for (peer_id, peer_key, peer_pq_key, peer_sig) in peers {
-                if !send_json(&mut ws_sender, &OutgoingMessage::peer_key(&peer_id, &peer_key, &peer_pq_key, peer_sig.as_deref())).await
+                if !send_json(
+                    &mut ws_sender,
+                    &OutgoingMessage::PeerKey {
+                        peer_id,
+                        public_key: peer_key,
+                        pq_public_key: peer_pq_key,
+                        sig: peer_sig,
+                    },
+                )
+                .await
                 {
                     tracing::error!("Failed to send peer key");
                     let _ = db::remove_participant(&state.db, &conn_id).await;
@@ -487,17 +385,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
     let tx = state.get_or_create_channel(&room_id).await;
     let mut rx = tx.subscribe();
 
-    let _ = tx.send(RoomMessage {
-        from_conn_id: conn_id.clone(),
-        target_conn_id: None,
-        payload: public_key.clone(),
-        msg_type: MessageType::PeerJoined,
-        pq_public_key: Some(pq_public_key.clone()),
-        pq_ciphertext: None,
+    let _ = tx.send(RoomEvent::PeerJoined {
+        from: conn_id.clone(),
+        public_key: public_key.clone(),
+        pq_public_key: pq_public_key.clone(),
         sig: announce_sig,
-        epoch: None,
-        counter: None,
-        tree_data: None,
     });
 
     let mut ping_interval = interval(PING_INTERVAL);
@@ -522,34 +414,26 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
 
             msg = rx.recv() => {
                 match msg {
-                    Ok(room_msg) => {
-                        if room_msg.from_conn_id == conn_id {
+                    Ok(event) => {
+                        if event.sender() == Some(conn_id.as_str()) {
                             continue;
                         }
 
-                        if let Some(ref target) = room_msg.target_conn_id
-                            && target != &conn_id
+                        if let Some(target) = event.target()
+                            && target != conn_id.as_str()
                         {
                             continue;
                         }
 
-                        let outgoing = match room_msg.msg_type {
-                            MessageType::Chat => OutgoingMessage::chat(&room_msg.from_conn_id, &room_msg.payload, room_msg.epoch, room_msg.counter),
-                            MessageType::TreeCommit => OutgoingMessage::tree_commit(&room_msg.from_conn_id, room_msg.tree_data.as_deref().unwrap_or_default()),
-                            MessageType::TreeWelcome => OutgoingMessage::tree_welcome(room_msg.tree_data.as_deref().unwrap_or_default()),
-                            MessageType::PeerJoined => OutgoingMessage::peer_joined(&room_msg.from_conn_id, &room_msg.payload, room_msg.pq_public_key.as_deref().unwrap_or_default(), room_msg.sig.as_deref()),
-                            MessageType::PeerLeft => OutgoingMessage::peer_left(&room_msg.from_conn_id),
-                            MessageType::Typing => OutgoingMessage::typing(&room_msg.from_conn_id),
-                            MessageType::RoomExpired => OutgoingMessage::room_expired(),
-                        };
+                        let is_expiry = matches!(event, RoomEvent::RoomExpired);
 
-                        if let Ok(json) = serde_json::to_string(&outgoing)
+                        if let Ok(json) = serde_json::to_string(&OutgoingMessage::from(event))
                             && ws_sender.send(Message::Text(json)).await.is_err()
                         {
                             break;
                         }
 
-                        if matches!(room_msg.msg_type, MessageType::RoomExpired) {
+                        if is_expiry {
                             let _ = ws_sender.close().await;
                             break;
                         }
@@ -574,75 +458,46 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                             }
                         };
 
-                        match incoming.msg_type.as_str() {
-                            "message" => {
-                                if let Some(payload) = incoming.payload {
-                                    if let Err(e) = db::update_activity(&state.db, &room_id).await {
-                                        tracing::error!("Failed to update activity: {}", e);
-                                    }
+                        match incoming {
+                            IncomingMessage::Message {
+                                payload: Some(payload),
+                                epoch,
+                                counter,
+                            } => {
+                                if let Err(e) = db::update_activity(&state.db, &room_id).await {
+                                    tracing::error!("Failed to update activity: {}", e);
+                                }
 
-                                    let _ = tx.send(RoomMessage {
-                                        from_conn_id: conn_id.clone(),
-                                        target_conn_id: None,
-                                        payload,
-                                        msg_type: MessageType::Chat,
-                                        pq_public_key: None,
-                                        pq_ciphertext: None,
-                                        sig: None,
-                                        epoch: incoming.epoch,
-                                        counter: incoming.counter,
-                                        tree_data: None,
-                                    });
-                                }
+                                let _ = tx.send(RoomEvent::Chat {
+                                    from: conn_id.clone(),
+                                    payload,
+                                    epoch,
+                                    counter,
+                                });
                             }
-                            "tree_commit" => {
-                                if let Some(tree_commit) = incoming.tree_commit {
-                                    tracing::info!("Tree commit from {}", conn_id);
-                                    let _ = tx.send(RoomMessage {
-                                        from_conn_id: conn_id.clone(),
-                                        target_conn_id: None,
-                                        payload: String::new(),
-                                        msg_type: MessageType::TreeCommit,
-                                        pq_public_key: None,
-                                        pq_ciphertext: None,
-                                        sig: None,
-                                        epoch: None,
-                                        counter: None,
-                                        tree_data: Some(tree_commit),
-                                    });
-                                }
+                            IncomingMessage::TreeCommit {
+                                tree_commit: Some(tree_commit),
+                            } => {
+                                tracing::info!("Tree commit from {}", conn_id);
+                                let _ = tx.send(RoomEvent::TreeCommit {
+                                    from: conn_id.clone(),
+                                    tree_data: tree_commit,
+                                });
                             }
-                            "tree_welcome" => {
-                                if let (Some(tree_welcome), Some(target_peer_id)) =
-                                    (incoming.tree_welcome, incoming.target_peer_id)
-                                {
-                                    tracing::info!("Tree welcome from {} to {}", conn_id, target_peer_id);
-                                    let _ = tx.send(RoomMessage {
-                                        from_conn_id: conn_id.clone(),
-                                        target_conn_id: Some(target_peer_id),
-                                        payload: String::new(),
-                                        msg_type: MessageType::TreeWelcome,
-                                        pq_public_key: None,
-                                        pq_ciphertext: None,
-                                        sig: None,
-                                        epoch: None,
-                                        counter: None,
-                                        tree_data: Some(tree_welcome),
-                                    });
-                                }
+                            IncomingMessage::TreeWelcome {
+                                tree_welcome: Some(tree_welcome),
+                                target_peer_id: Some(target_peer_id),
+                            } => {
+                                tracing::info!("Tree welcome from {} to {}", conn_id, target_peer_id);
+                                let _ = tx.send(RoomEvent::TreeWelcome {
+                                    from: conn_id.clone(),
+                                    target: target_peer_id,
+                                    tree_data: tree_welcome,
+                                });
                             }
-                            "typing" => {
-                                let _ = tx.send(RoomMessage {
-                                    from_conn_id: conn_id.clone(),
-                                    target_conn_id: None,
-                                    payload: String::new(),
-                                    msg_type: MessageType::Typing,
-                                    pq_public_key: None,
-                                    pq_ciphertext: None,
-                                    sig: None,
-                                    epoch: None,
-                                    counter: None,
-                                    tree_data: None,
+                            IncomingMessage::Typing => {
+                                let _ = tx.send(RoomEvent::Typing {
+                                    from: conn_id.clone(),
                                 });
                             }
                             _ => {}
@@ -682,17 +537,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
         Err(e) => tracing::error!("Failed to reset creator: {}", e),
     }
 
-    let _ = tx.send(RoomMessage {
-        from_conn_id: conn_id.clone(),
-        target_conn_id: None,
-        payload: String::new(),
-        msg_type: MessageType::PeerLeft,
-        pq_public_key: None,
-        pq_ciphertext: None,
-        sig: None,
-        epoch: None,
-        counter: None,
-        tree_data: None,
+    let _ = tx.send(RoomEvent::PeerLeft {
+        from: conn_id.clone(),
     });
 
     tracing::info!("Connection {} disconnected from room {}", conn_id, room_id);
@@ -780,5 +626,210 @@ mod tests {
         assert!(rl.check(later));
         assert!(rl.check(later));
         assert!(!rl.check(later));
+    }
+
+    #[test]
+    fn welcome_serializes_with_creator() {
+        let json = serde_json::to_string(&OutgoingMessage::Welcome {
+            peer_id: "p1".to_string(),
+            is_creator: true,
+            creator_id: Some("c1".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"welcome","peer_id":"p1","is_creator":true,"creator_id":"c1"}"#
+        );
+    }
+
+    #[test]
+    fn welcome_omits_creator_when_absent() {
+        let json = serde_json::to_string(&OutgoingMessage::Welcome {
+            peer_id: "p1".to_string(),
+            is_creator: false,
+            creator_id: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"welcome","peer_id":"p1","is_creator":false}"#);
+    }
+
+    #[test]
+    fn peer_key_omits_sig_when_absent() {
+        let json = serde_json::to_string(&OutgoingMessage::PeerKey {
+            peer_id: "p1".to_string(),
+            public_key: "PK".to_string(),
+            pq_public_key: "PQ".to_string(),
+            sig: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"peer_key","peer_id":"p1","public_key":"PK","pq_public_key":"PQ"}"#
+        );
+    }
+
+    #[test]
+    fn peer_key_includes_sig_when_present() {
+        let json = serde_json::to_string(&OutgoingMessage::PeerKey {
+            peer_id: "p1".to_string(),
+            public_key: "PK".to_string(),
+            pq_public_key: "PQ".to_string(),
+            sig: Some("S".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"peer_key","peer_id":"p1","public_key":"PK","pq_public_key":"PQ","sig":"S"}"#
+        );
+    }
+
+    #[test]
+    fn chat_event_maps_to_message_frame() {
+        let json = serde_json::to_string(&OutgoingMessage::from(RoomEvent::Chat {
+            from: "p1".to_string(),
+            payload: "X".to_string(),
+            epoch: Some(7),
+            counter: Some(42),
+        }))
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"message","peer_id":"p1","payload":"X","epoch":7,"counter":42}"#
+        );
+    }
+
+    #[test]
+    fn chat_event_omits_epoch_and_counter_when_absent() {
+        let json = serde_json::to_string(&OutgoingMessage::from(RoomEvent::Chat {
+            from: "p1".to_string(),
+            payload: "X".to_string(),
+            epoch: None,
+            counter: None,
+        }))
+        .unwrap();
+        assert_eq!(json, r#"{"type":"message","peer_id":"p1","payload":"X"}"#);
+    }
+
+    #[test]
+    fn peer_joined_event_maps_to_peer_joined_frame() {
+        let json = serde_json::to_string(&OutgoingMessage::from(RoomEvent::PeerJoined {
+            from: "p1".to_string(),
+            public_key: "PK".to_string(),
+            pq_public_key: "PQ".to_string(),
+            sig: None,
+        }))
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"peer_joined","peer_id":"p1","public_key":"PK","pq_public_key":"PQ"}"#
+        );
+    }
+
+    #[test]
+    fn tree_commit_event_maps_to_tree_commit_frame() {
+        let json = serde_json::to_string(&OutgoingMessage::from(RoomEvent::TreeCommit {
+            from: "p1".to_string(),
+            tree_data: "TC".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"tree_commit","peer_id":"p1","tree_commit":"TC"}"#
+        );
+    }
+
+    #[test]
+    fn tree_welcome_event_maps_to_tree_welcome_frame() {
+        let json = serde_json::to_string(&OutgoingMessage::from(RoomEvent::TreeWelcome {
+            from: "p1".to_string(),
+            target: "p2".to_string(),
+            tree_data: "TW".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(json, r#"{"type":"tree_welcome","tree_welcome":"TW"}"#);
+    }
+
+    #[test]
+    fn typing_event_maps_to_typing_frame() {
+        let json = serde_json::to_string(&OutgoingMessage::from(RoomEvent::Typing {
+            from: "p1".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(json, r#"{"type":"typing","peer_id":"p1"}"#);
+    }
+
+    #[test]
+    fn peer_left_event_maps_to_peer_left_frame() {
+        let json = serde_json::to_string(&OutgoingMessage::from(RoomEvent::PeerLeft {
+            from: "p1".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(json, r#"{"type":"peer_left","peer_id":"p1"}"#);
+    }
+
+    #[test]
+    fn room_expired_event_maps_to_room_expired_frame() {
+        let json = serde_json::to_string(&OutgoingMessage::from(RoomEvent::RoomExpired)).unwrap();
+        assert_eq!(json, r#"{"type":"room_expired"}"#);
+    }
+
+    #[test]
+    fn room_full_serializes_as_bare_type() {
+        let json = serde_json::to_string(&OutgoingMessage::RoomFull).unwrap();
+        assert_eq!(json, r#"{"type":"room_full"}"#);
+    }
+
+    #[test]
+    fn parses_key_announce_with_all_fields() {
+        let msg: IncomingMessage = serde_json::from_str(
+            r#"{"type":"key_announce","public_key":"PK","pq_public_key":"PQ","sig":"S"}"#,
+        )
+        .unwrap();
+        match msg {
+            IncomingMessage::KeyAnnounce {
+                public_key,
+                pq_public_key,
+                sig,
+            } => {
+                assert_eq!(public_key.as_deref(), Some("PK"));
+                assert_eq!(pq_public_key.as_deref(), Some("PQ"));
+                assert_eq!(sig.as_deref(), Some("S"));
+            }
+            _ => panic!("expected KeyAnnounce"),
+        }
+    }
+
+    #[test]
+    fn parses_message_and_defaults_missing_fields() {
+        let msg: IncomingMessage =
+            serde_json::from_str(r#"{"type":"message","payload":"X"}"#).unwrap();
+        match msg {
+            IncomingMessage::Message {
+                payload,
+                epoch,
+                counter,
+            } => {
+                assert_eq!(payload.as_deref(), Some("X"));
+                assert_eq!(epoch, None);
+                assert_eq!(counter, None);
+            }
+            _ => panic!("expected Message"),
+        }
+    }
+
+    #[test]
+    fn unknown_type_deserializes_to_unknown_not_error() {
+        let msg: IncomingMessage =
+            serde_json::from_str(r#"{"type":"definitely_not_a_real_type","foo":1}"#).unwrap();
+        assert!(matches!(msg, IncomingMessage::Unknown));
+    }
+
+    #[test]
+    fn legacy_and_unknown_fields_are_ignored() {
+        let msg: IncomingMessage = serde_json::from_str(
+            r#"{"type":"message","payload":"X","pq_ciphertext":"legacy","extra":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(msg, IncomingMessage::Message { .. }));
     }
 }
