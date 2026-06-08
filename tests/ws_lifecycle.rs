@@ -131,6 +131,10 @@ async fn welcome_is_sent_to_the_first_connection() {
     let (_ws, welcome) = join(addr, &room).await;
 
     assert_eq!(welcome["type"], "welcome");
+    assert_eq!(
+        welcome["protocol_version"], 1,
+        "welcome announces the protocol version"
+    );
     assert!(
         welcome["peer_id"].as_str().is_some_and(|s| !s.is_empty()),
         "welcome should carry a non-empty peer_id"
