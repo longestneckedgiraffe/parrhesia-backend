@@ -13,7 +13,7 @@ use tokio::time::{interval, timeout};
 use uuid::Uuid;
 
 use crate::db;
-use crate::state::{AppState, RoomEvent};
+use crate::state::{AppState, JoinOutcome, Participant, RoomEvent};
 
 fn is_valid_mldsa65_public_key(base64_key: &str) -> bool {
     match STANDARD.decode(base64_key) {
@@ -30,7 +30,7 @@ fn is_valid_mlkem768_public_key(base64_key: &str) -> bool {
 }
 
 const PROTOCOL_VERSION: u32 = 1;
-const MAX_PARTICIPANTS: i64 = 16;
+const MAX_PARTICIPANTS: usize = 16;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -246,303 +246,275 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
     let conn_id = Uuid::new_v4().to_string();
     tracing::info!("New WebSocket connection: {} to room {}", conn_id, room_id);
 
-    let is_creator = match db::set_creator(&state.db, &room_id, &conn_id).await {
-        Ok(became_creator) => became_creator,
-        Err(e) => {
-            tracing::error!("Failed to set creator: {}", e);
-            false
-        }
-    };
-
-    let creator_id = match db::get_creator(&state.db, &room_id).await {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!("Failed to get creator: {}", e);
-            None
-        }
-    };
+    let (tx, is_creator, creator_id) = state.attach(&room_id, &conn_id).await;
 
     if is_creator {
         tracing::info!("Connection {} is the room creator", conn_id);
     }
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
+    let mut announced = false;
 
-    if !send_json(
-        &mut ws_sender,
-        &OutgoingMessage::Welcome {
-            protocol_version: PROTOCOL_VERSION,
-            peer_id: conn_id.clone(),
-            is_creator,
-            creator_id: creator_id.clone(),
-        },
-    )
-    .await
-    {
-        tracing::error!("Failed to send welcome message");
-        return;
-    }
+    'session: {
+        if !send_json(
+            &mut ws_sender,
+            &OutgoingMessage::Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                peer_id: conn_id.clone(),
+                is_creator,
+                creator_id,
+            },
+        )
+        .await
+        {
+            tracing::error!("Failed to send welcome message");
+            break 'session;
+        }
 
-    let handshake = timeout(HANDSHAKE_TIMEOUT, async {
-        loop {
-            match ws_receiver.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(IncomingMessage::KeyAnnounce {
-                        public_key: Some(key),
-                        pq_public_key,
-                        sig,
-                    }) = serde_json::from_str::<IncomingMessage>(&text)
-                    {
-                        if !is_valid_mldsa65_public_key(&key) {
-                            tracing::warn!("Invalid public key format from {}", conn_id);
-                            return None;
-                        }
-                        match pq_public_key {
-                            Some(pq_key) if is_valid_mlkem768_public_key(&pq_key) => {
-                                return Some((key, pq_key, sig));
-                            }
-                            _ => {
-                                tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
+        let handshake = timeout(HANDSHAKE_TIMEOUT, async {
+            loop {
+                match ws_receiver.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(IncomingMessage::KeyAnnounce {
+                            public_key: Some(key),
+                            pq_public_key,
+                            sig,
+                        }) = serde_json::from_str::<IncomingMessage>(&text)
+                        {
+                            if !is_valid_mldsa65_public_key(&key) {
+                                tracing::warn!("Invalid public key format from {}", conn_id);
                                 return None;
                             }
-                        }
-                    }
-                    tracing::warn!("Expected key_announce, got: {}", text);
-                }
-                Some(Ok(Message::Close(_))) | None => {
-                    tracing::info!("Client disconnected before key exchange: {}", conn_id);
-                    return None;
-                }
-                Some(Err(e)) => {
-                    tracing::error!("WebSocket error during key exchange: {}", e);
-                    return None;
-                }
-                _ => continue,
-            }
-        }
-    })
-    .await;
-
-    let (public_key, pq_public_key, announce_sig) = match handshake {
-        Ok(Some(keys)) => keys,
-        Ok(None) => return,
-        Err(_) => {
-            tracing::warn!("Key-exchange handshake timed out for {}", conn_id);
-            return;
-        }
-    };
-
-    tracing::info!("Received public key from {}", conn_id);
-
-    let added = match db::try_add_participant(
-        &state.db,
-        &conn_id,
-        &room_id,
-        &public_key,
-        &pq_public_key,
-        announce_sig.as_deref(),
-        MAX_PARTICIPANTS,
-    )
-    .await
-    {
-        Ok(added) => added,
-        Err(e) => {
-            tracing::error!("Failed to add participant: {}", e);
-            return;
-        }
-    };
-
-    if !added {
-        tracing::warn!("Room {} is full", room_id);
-        let _ = send_json(&mut ws_sender, &OutgoingMessage::RoomFull).await;
-        return;
-    }
-
-    match db::get_other_public_keys(&state.db, &room_id, &conn_id).await {
-        Ok(peers) => {
-            for (peer_id, peer_key, peer_pq_key, peer_sig) in peers {
-                if !send_json(
-                    &mut ws_sender,
-                    &OutgoingMessage::PeerKey {
-                        peer_id,
-                        public_key: peer_key,
-                        pq_public_key: peer_pq_key,
-                        sig: peer_sig,
-                    },
-                )
-                .await
-                {
-                    tracing::error!("Failed to send peer key");
-                    let _ = db::remove_participant(&state.db, &conn_id).await;
-                    return;
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to get peer keys: {}", e);
-            let _ = db::remove_participant(&state.db, &conn_id).await;
-            return;
-        }
-    }
-
-    let tx = state.get_or_create_channel(&room_id).await;
-    let mut rx = tx.subscribe();
-
-    let _ = tx.send(RoomEvent::PeerJoined {
-        from: conn_id.clone(),
-        public_key: public_key.clone(),
-        pq_public_key: pq_public_key.clone(),
-        sig: announce_sig,
-    });
-
-    let mut ping_interval = interval(PING_INTERVAL);
-    let mut last_pong = Instant::now();
-    let mut waiting_for_pong = false;
-    let mut rate_limiter = RateLimiter::new(MSG_RATE_CAPACITY, MSG_RATE_REFILL_PER_SEC);
-
-    loop {
-        tokio::select! {
-            _ = ping_interval.tick() => {
-                if waiting_for_pong && last_pong.elapsed() > PONG_TIMEOUT {
-                    tracing::warn!("Connection {} timed out (no pong received)", conn_id);
-                    break;
-                }
-
-                if ws_sender.send(Message::Ping(vec![])).await.is_err() {
-                    tracing::error!("Failed to send ping to {}", conn_id);
-                    break;
-                }
-                waiting_for_pong = true;
-            }
-
-            msg = rx.recv() => {
-                match msg {
-                    Ok(event) => {
-                        if event.sender() == Some(conn_id.as_str()) {
-                            continue;
-                        }
-
-                        if let Some(target) = event.target()
-                            && target != conn_id.as_str()
-                        {
-                            continue;
-                        }
-
-                        let is_expiry = matches!(event, RoomEvent::RoomExpired);
-
-                        if let Ok(json) = serde_json::to_string(&OutgoingMessage::from(event))
-                            && ws_sender.send(Message::Text(json)).await.is_err()
-                        {
-                            break;
-                        }
-
-                        if is_expiry {
-                            let _ = ws_sender.close().await;
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            msg = ws_receiver.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if !rate_limiter.check(Instant::now()) {
-                            tracing::debug!("Rate limit exceeded for {}, dropping message", conn_id);
-                            continue;
-                        }
-
-                        let incoming: IncomingMessage = match serde_json::from_str(&text) {
-                            Ok(m) => m,
-                            Err(_) => {
-                                tracing::warn!("Invalid message format from {}", conn_id);
-                                continue;
-                            }
-                        };
-
-                        match incoming {
-                            IncomingMessage::Message {
-                                payload: Some(payload),
-                                epoch,
-                                counter,
-                            } => {
-                                if let Err(e) = db::update_activity(&state.db, &room_id).await {
-                                    tracing::error!("Failed to update activity: {}", e);
+                            match pq_public_key {
+                                Some(pq_key) if is_valid_mlkem768_public_key(&pq_key) => {
+                                    return Some((key, pq_key, sig));
                                 }
-
-                                let _ = tx.send(RoomEvent::Chat {
-                                    from: conn_id.clone(),
-                                    payload,
-                                    epoch,
-                                    counter,
-                                });
+                                _ => {
+                                    tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
+                                    return None;
+                                }
                             }
-                            IncomingMessage::TreeCommit {
-                                tree_commit: Some(tree_commit),
-                            } => {
-                                tracing::info!("Tree commit from {}", conn_id);
-                                let _ = tx.send(RoomEvent::TreeCommit {
-                                    from: conn_id.clone(),
-                                    tree_data: tree_commit,
-                                });
-                            }
-                            IncomingMessage::TreeWelcome {
-                                tree_welcome: Some(tree_welcome),
-                                target_peer_id: Some(target_peer_id),
-                            } => {
-                                tracing::info!("Tree welcome from {} to {}", conn_id, target_peer_id);
-                                let _ = tx.send(RoomEvent::TreeWelcome {
-                                    from: conn_id.clone(),
-                                    target: target_peer_id,
-                                    tree_data: tree_welcome,
-                                });
-                            }
-                            IncomingMessage::Typing => {
-                                let _ = tx.send(RoomEvent::Typing {
-                                    from: conn_id.clone(),
-                                });
-                            }
-                            _ => {}
                         }
+                        tracing::warn!("Expected key_announce, got: {}", text);
                     }
-                    Some(Ok(Message::Pong(_))) => {
-                        last_pong = Instant::now();
-                        waiting_for_pong = false;
-                    }
-                    Some(Ok(Message::Ping(data))) => {
-                        if ws_sender.send(Message::Pong(data)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) => {
-                        tracing::info!("WebSocket closed by client: {}", conn_id);
-                        break;
+                    Some(Ok(Message::Close(_))) | None => {
+                        tracing::info!("Client disconnected before key exchange: {}", conn_id);
+                        return None;
                     }
                     Some(Err(e)) => {
-                        tracing::error!("WebSocket error for {}: {}", conn_id, e);
+                        tracing::error!("WebSocket error during key exchange: {}", e);
+                        return None;
+                    }
+                    _ => continue,
+                }
+            }
+        })
+        .await;
+
+        let (public_key, pq_public_key, announce_sig) = match handshake {
+            Ok(Some(keys)) => keys,
+            Ok(None) => break 'session,
+            Err(_) => {
+                tracing::warn!("Key-exchange handshake timed out for {}", conn_id);
+                break 'session;
+            }
+        };
+
+        tracing::info!("Received public key from {}", conn_id);
+
+        let (mut rx, peers) = match state
+            .join(
+                &room_id,
+                &conn_id,
+                Participant {
+                    public_key: public_key.clone(),
+                    pq_public_key: pq_public_key.clone(),
+                    sig: announce_sig.clone(),
+                },
+                MAX_PARTICIPANTS,
+            )
+            .await
+        {
+            JoinOutcome::Joined { receiver, peers } => (receiver, peers),
+            JoinOutcome::Full => {
+                tracing::warn!("Room {} is full", room_id);
+                let _ = send_json(&mut ws_sender, &OutgoingMessage::RoomFull).await;
+                break 'session;
+            }
+            JoinOutcome::RoomGone => {
+                tracing::warn!("Room {} no longer exists", room_id);
+                break 'session;
+            }
+        };
+
+        for (peer_id, peer_key, peer_pq_key, peer_sig) in peers {
+            if !send_json(
+                &mut ws_sender,
+                &OutgoingMessage::PeerKey {
+                    peer_id,
+                    public_key: peer_key,
+                    pq_public_key: peer_pq_key,
+                    sig: peer_sig,
+                },
+            )
+            .await
+            {
+                tracing::error!("Failed to send peer key");
+                break 'session;
+            }
+        }
+
+        let _ = tx.send(RoomEvent::PeerJoined {
+            from: conn_id.clone(),
+            public_key,
+            pq_public_key,
+            sig: announce_sig,
+        });
+        announced = true;
+
+        let mut ping_interval = interval(PING_INTERVAL);
+        let mut last_pong = Instant::now();
+        let mut waiting_for_pong = false;
+        let mut rate_limiter = RateLimiter::new(MSG_RATE_CAPACITY, MSG_RATE_REFILL_PER_SEC);
+
+        loop {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    if waiting_for_pong && last_pong.elapsed() > PONG_TIMEOUT {
+                        tracing::warn!("Connection {} timed out (no pong received)", conn_id);
                         break;
                     }
-                    None => break,
-                    _ => {}
+
+                    if ws_sender.send(Message::Ping(vec![])).await.is_err() {
+                        tracing::error!("Failed to send ping to {}", conn_id);
+                        break;
+                    }
+                    waiting_for_pong = true;
+                }
+
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(event) => {
+                            if event.sender() == Some(conn_id.as_str()) {
+                                continue;
+                            }
+
+                            if let Some(target) = event.target()
+                                && target != conn_id.as_str()
+                            {
+                                continue;
+                            }
+
+                            let is_expiry = matches!(event, RoomEvent::RoomExpired);
+
+                            if let Ok(json) = serde_json::to_string(&OutgoingMessage::from(event))
+                                && ws_sender.send(Message::Text(json)).await.is_err()
+                            {
+                                break;
+                            }
+
+                            if is_expiry {
+                                let _ = ws_sender.close().await;
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                msg = ws_receiver.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if !rate_limiter.check(Instant::now()) {
+                                tracing::debug!("Rate limit exceeded for {}, dropping message", conn_id);
+                                continue;
+                            }
+
+                            let incoming: IncomingMessage = match serde_json::from_str(&text) {
+                                Ok(m) => m,
+                                Err(_) => {
+                                    tracing::warn!("Invalid message format from {}", conn_id);
+                                    continue;
+                                }
+                            };
+
+                            match incoming {
+                                IncomingMessage::Message {
+                                    payload: Some(payload),
+                                    epoch,
+                                    counter,
+                                } => {
+                                    if let Err(e) = db::update_activity(&state.db, &room_id).await {
+                                        tracing::error!("Failed to update activity: {}", e);
+                                    }
+
+                                    let _ = tx.send(RoomEvent::Chat {
+                                        from: conn_id.clone(),
+                                        payload,
+                                        epoch,
+                                        counter,
+                                    });
+                                }
+                                IncomingMessage::TreeCommit {
+                                    tree_commit: Some(tree_commit),
+                                } => {
+                                    tracing::info!("Tree commit from {}", conn_id);
+                                    let _ = tx.send(RoomEvent::TreeCommit {
+                                        from: conn_id.clone(),
+                                        tree_data: tree_commit,
+                                    });
+                                }
+                                IncomingMessage::TreeWelcome {
+                                    tree_welcome: Some(tree_welcome),
+                                    target_peer_id: Some(target_peer_id),
+                                } => {
+                                    tracing::info!("Tree welcome from {} to {}", conn_id, target_peer_id);
+                                    let _ = tx.send(RoomEvent::TreeWelcome {
+                                        from: conn_id.clone(),
+                                        target: target_peer_id,
+                                        tree_data: tree_welcome,
+                                    });
+                                }
+                                IncomingMessage::Typing => {
+                                    let _ = tx.send(RoomEvent::Typing {
+                                        from: conn_id.clone(),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) => {
+                            last_pong = Instant::now();
+                            waiting_for_pong = false;
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            if ws_sender.send(Message::Pong(data)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            tracing::info!("WebSocket closed by client: {}", conn_id);
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            tracing::error!("WebSocket error for {}: {}", conn_id, e);
+                            break;
+                        }
+                        None => break,
+                        _ => {}
+                    }
                 }
             }
         }
     }
 
-    if let Err(e) = db::remove_participant(&state.db, &conn_id).await {
-        tracing::error!("Failed to remove participant: {}", e);
-    }
+    state.detach(&room_id, &conn_id).await;
 
-    match db::reset_creator_if_empty(&state.db, &room_id).await {
-        Ok(true) => tracing::info!("Room {} is now empty, creator reset", room_id),
-        Ok(false) => {}
-        Err(e) => tracing::error!("Failed to reset creator: {}", e),
+    if announced {
+        let _ = tx.send(RoomEvent::PeerLeft {
+            from: conn_id.clone(),
+        });
     }
-
-    let _ = tx.send(RoomEvent::PeerLeft {
-        from: conn_id.clone(),
-    });
 
     tracing::info!("Connection {} disconnected from room {}", conn_id, room_id);
 }

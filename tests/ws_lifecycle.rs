@@ -167,6 +167,44 @@ async fn second_peer_learns_first_key_and_first_is_notified() {
 }
 
 #[tokio::test]
+async fn simultaneous_joiners_learn_each_other() {
+    let (addr, pool) = spawn_app().await;
+    let room = create_room(&pool).await;
+
+    let mut a = open(addr, &room).await;
+    let welcome_a = next_json(&mut a).await;
+    let a_id = welcome_a["peer_id"].as_str().unwrap().to_string();
+
+    let mut b = open(addr, &room).await;
+    let welcome_b = next_json(&mut b).await;
+    let b_id = welcome_b["peer_id"].as_str().unwrap().to_string();
+
+    let announce = json!({
+        "type": "key_announce",
+        "public_key": b64_zeros(MLDSA_LEN),
+        "pq_public_key": b64_zeros(MLKEM_LEN),
+    });
+    a.send(Message::Text(announce.to_string())).await.unwrap();
+    b.send(Message::Text(announce.to_string())).await.unwrap();
+
+    let a_learns = next_json(&mut a).await;
+    assert_eq!(a_learns["peer_id"], b_id);
+    assert!(matches!(
+        a_learns["type"].as_str(),
+        Some("peer_joined") | Some("peer_key")
+    ));
+    assert_eq!(a_learns["public_key"], b64_zeros(MLDSA_LEN));
+
+    let b_learns = next_json(&mut b).await;
+    assert_eq!(b_learns["peer_id"], a_id);
+    assert!(matches!(
+        b_learns["type"].as_str(),
+        Some("peer_joined") | Some("peer_key")
+    ));
+    assert_eq!(b_learns["public_key"], b64_zeros(MLDSA_LEN));
+}
+
+#[tokio::test]
 async fn a_message_is_relayed_to_the_other_peer() {
     let (addr, pool) = spawn_app().await;
     let room = create_room(&pool).await;
