@@ -1,9 +1,9 @@
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
-use crate::config::Config;
+use crate::{admission::Admission, config::Config, db, passwords::PasswordService};
 
 pub type RoomMap = Arc<RwLock<HashMap<String, Room>>>;
 
@@ -100,6 +100,8 @@ pub struct AppState {
     pub db: SqlitePool,
     pub config: Arc<Config>,
     pub rooms: RoomMap,
+    pub admission: Arc<Admission>,
+    pub passwords: PasswordService,
 }
 
 impl AppState {
@@ -108,6 +110,8 @@ impl AppState {
             db,
             config: Arc::new(config),
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            admission: Arc::new(Admission::default()),
+            passwords: PasswordService::default(),
         }
     }
 
@@ -115,8 +119,13 @@ impl AppState {
         &self,
         room_id: &str,
         conn_id: &str,
-    ) -> (broadcast::Sender<RoomEvent>, bool, Option<String>) {
+    ) -> Result<Option<(broadcast::Sender<RoomEvent>, bool, Option<String>)>, sqlx::Error> {
         let mut rooms = self.rooms.write().await;
+        // Cleanup takes this same lock before deleting database rows. No KDF is
+        // ever performed under the lock, and an expired room cannot be recreated.
+        if !db::room_exists(&self.db, room_id).await? {
+            return Ok(None);
+        }
         let room = rooms.entry(room_id.to_string()).or_insert_with(Room::new);
         let is_creator = if room.creator_id.is_none() {
             room.creator_id = Some(conn_id.to_string());
@@ -124,7 +133,7 @@ impl AppState {
         } else {
             false
         };
-        (room.tx.clone(), is_creator, room.creator_id.clone())
+        Ok(Some((room.tx.clone(), is_creator, room.creator_id.clone())))
     }
 
     pub async fn join(
@@ -168,18 +177,17 @@ impl AppState {
         }
     }
 
-    pub async fn broadcast_room_expired(&self, room_ids: &[String]) {
-        let rooms = self.rooms.read().await;
-        for room_id in room_ids {
-            if let Some(room) = rooms.get(room_id) {
+    pub async fn expire_inactive_rooms(
+        &self,
+        threshold_secs: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let mut rooms = self.rooms.write().await;
+        let deleted = db::delete_inactive_rooms(&self.db, threshold_secs).await?;
+        for id in &deleted {
+            if let Some(room) = rooms.remove(id) {
                 let _ = room.tx.send(RoomEvent::RoomExpired);
             }
         }
-        drop(rooms);
-
-        let mut rooms = self.rooms.write().await;
-        for room_id in room_ids {
-            rooms.remove(room_id);
-        }
+        Ok(deleted)
     }
 }

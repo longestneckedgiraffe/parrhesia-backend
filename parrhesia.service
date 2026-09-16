@@ -13,6 +13,9 @@ RestartSec=5
 
 # Environment
 Environment=PORT=3000
+Environment=BIND_ADDRESS=127.0.0.1
+Environment=TRUSTED_PROXY_IPS=127.0.0.1
+Environment=ALLOWED_ORIGINS=https://parrhesia.chat
 Environment=DATABASE_URL=sqlite:./parrhesia.db?mode=rwc
 Environment=INACTIVITY_EXPIRY_HOURS=24
 Environment=CLEANUP_INTERVAL_MINS=5

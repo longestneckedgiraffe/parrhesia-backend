@@ -1,19 +1,31 @@
 use axum::{
     extract::{
+        ConnectInfo, Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
-        Path, State, WebSocketUpgrade,
     },
+    http::{HeaderMap, StatusCode, header},
     response::Response,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 use tokio::time::{interval, timeout};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
-use crate::db;
+use super::rooms::{admission_error, error};
 use crate::state::{AppState, JoinOutcome, Participant, RoomEvent};
+use crate::{
+    admission::{AdmissionError, Budget, PendingAuth},
+    db,
+    passwords::PasswordError,
+    security::client_ip,
+};
 
 fn is_valid_mldsa65_public_key(base64_key: &str) -> bool {
     match STANDARD.decode(base64_key) {
@@ -75,7 +87,9 @@ impl RateLimiter {
     /// Refills based on elapsed time, then tries to spend one token. Returns
     /// false (caller should drop the message) when the bucket is empty.
     fn check(&mut self, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
         self.last_refill = now;
         self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         if self.tokens >= 1.0 {
@@ -124,6 +138,15 @@ enum IncomingMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutgoingMessage {
+    AuthRequired {
+        protocol_version: u32,
+    },
+    AuthFailed,
+    AuthRateLimited {
+        retry_after_secs: u64,
+    },
+    AuthUnavailable,
+    Joined,
     Welcome {
         protocol_version: u32,
         peer_id: String,
@@ -213,10 +236,138 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(room_id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Response {
+    let origins: Vec<_> = headers.get_all(header::ORIGIN).iter().collect();
+    if origins.len() != 1
+        || !origins[0].to_str().ok().is_some_and(|origin| {
+            state
+                .config
+                .allowed_origins
+                .iter()
+                .any(|allowed| allowed == origin)
+        })
+    {
+        state.admission.rejected.fetch_add(1, Ordering::Relaxed);
+        return error(StatusCode::FORBIDDEN, "Origin not allowed");
+    }
+    let ip = match client_ip(peer.ip(), &headers, &state.config.trusted_proxies) {
+        Ok(ip) => ip,
+        Err(status) => return error(status, "Invalid client address"),
+    };
+    if let Err(err) = state.admission.check(Budget::Connection(ip)) {
+        return admission_error(err);
+    }
+    let room = match db::room_password(&state.db, &room_id).await {
+        Ok(room) => room,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Admission temporarily unavailable",
+            );
+        }
+    };
+    let pending = if room.as_ref().is_some_and(|hash| hash.is_some()) {
+        match state.admission.pending(ip) {
+            Ok(guard) => Some(guard),
+            Err(err) => return admission_error(err),
+        }
+    } else {
+        None
+    };
     ws.max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state, room_id))
+        .on_upgrade(move |socket| handle_socket(socket, state, room_id, room, pending))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum Authentication {
+    Authenticate { password: String },
+}
+
+async fn authenticate(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    state: &AppState,
+    room_id: &str,
+    hash: String,
+) -> bool {
+    let result = timeout(HANDSHAKE_TIMEOUT, async {
+        if !send_json(
+            sender,
+            &OutgoingMessage::AuthRequired {
+                protocol_version: 2,
+            },
+        )
+        .await
+        {
+            return Err(OutgoingMessage::AuthFailed);
+        }
+        let text = loop {
+            match receiver.next().await {
+                Some(Ok(Message::Text(text))) if text.len() <= 4096 => break Zeroizing::new(text),
+                Some(Ok(Message::Ping(data))) => {
+                    if sender.send(Message::Pong(data)).await.is_err() {
+                        return Err(OutgoingMessage::AuthFailed);
+                    }
+                }
+                Some(Ok(Message::Pong(_))) => continue,
+                _ => return Err(OutgoingMessage::AuthFailed),
+            }
+        };
+        let Authentication::Authenticate { password } =
+            serde_json::from_str(&text).map_err(|_| OutgoingMessage::AuthFailed)?;
+        drop(text);
+        // Spend the room budget before verification. Reconnecting cannot reset it.
+        if let Err(err) = state.admission.check(Budget::Room(room_id.to_owned())) {
+            drop(Zeroizing::new(password));
+            return Err(match err {
+                AdmissionError::Limited(retry_after_secs) => {
+                    OutgoingMessage::AuthRateLimited { retry_after_secs }
+                }
+                AdmissionError::Unavailable => OutgoingMessage::AuthUnavailable,
+            });
+        }
+        let verification = tokio::select! {
+            result = state.passwords.verify(password, hash) => result,
+            // A second frame or disconnect cancels the wait, never the KDF's permit.
+            _ = receiver.next() => return Err(OutgoingMessage::AuthFailed),
+        };
+        match verification {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(PasswordError::Invalid) => {
+                state
+                    .admission
+                    .verification_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(OutgoingMessage::AuthFailed)
+            }
+            Err(_) => {
+                state.admission.unavailable.fetch_add(1, Ordering::Relaxed);
+                Err(OutgoingMessage::AuthUnavailable)
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => true,
+        other => {
+            state.admission.rejected.fetch_add(1, Ordering::Relaxed);
+            let failure = other
+                .ok()
+                .and_then(Result::err)
+                .unwrap_or(OutgoingMessage::AuthFailed);
+            // Bound writes too: a peer that does not read must not retain a slot.
+            let _ = timeout(Duration::from_secs(1), async {
+                let _ = send_json(sender, &failure).await;
+                let _ = sender.send(Message::Close(None)).await;
+            })
+            .await;
+            false
+        }
+    }
 }
 
 async fn send_json<T: Serialize>(
@@ -229,37 +380,44 @@ async fn send_json<T: Serialize>(
     }
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
-    let exists = match db::room_exists(&state.db, &room_id).await {
-        Ok(exists) => exists,
-        Err(e) => {
-            tracing::error!("Failed to check room existence: {}", e);
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    room_id: String,
+    room: Option<Option<String>>,
+    pending: Option<PendingAuth>,
+) {
+    let Some(hash) = room else {
+        return;
+    };
+    let protected = hash.is_some();
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    if let Some(hash) = hash
+        && !authenticate(&mut ws_sender, &mut ws_receiver, &state, &room_id, hash).await
+    {
+        return;
+    }
+    drop(pending);
+    let conn_id = Uuid::new_v4().to_string();
+    let (tx, is_creator, creator_id) = match state.attach(&room_id, &conn_id).await {
+        Ok(Some(attached)) => attached,
+        _ => {
+            let _ = timeout(
+                Duration::from_secs(1),
+                send_json(&mut ws_sender, &OutgoingMessage::AuthUnavailable),
+            )
+            .await;
             return;
         }
     };
 
-    if !exists {
-        tracing::warn!("WebSocket connection to non-existent room: {}", room_id);
-        return;
-    }
-
-    let conn_id = Uuid::new_v4().to_string();
-    tracing::info!("New WebSocket connection: {} to room {}", conn_id, room_id);
-
-    let (tx, is_creator, creator_id) = state.attach(&room_id, &conn_id).await;
-
-    if is_creator {
-        tracing::info!("Connection {} is the room creator", conn_id);
-    }
-
-    let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut announced = false;
 
     'session: {
         if !send_json(
             &mut ws_sender,
             &OutgoingMessage::Welcome {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: if protected { 2 } else { PROTOCOL_VERSION },
                 peer_id: conn_id.clone(),
                 is_creator,
                 creator_id,
@@ -290,22 +448,27 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                                     return Some((key, pq_key, sig));
                                 }
                                 _ => {
-                                    tracing::warn!("Missing or invalid ML-KEM public key from {}", conn_id);
+                                    tracing::warn!(
+                                        "Missing or invalid ML-KEM public key from {}",
+                                        conn_id
+                                    );
                                     return None;
                                 }
                             }
                         }
-                        tracing::warn!("Expected key_announce, got: {}", text);
+                        tracing::warn!("Expected key_announce");
+                        return None;
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         tracing::info!("Client disconnected before key exchange: {}", conn_id);
                         return None;
                     }
-                    Some(Err(e)) => {
-                        tracing::error!("WebSocket error during key exchange: {}", e);
+                    Some(Err(_)) => {
+                        tracing::warn!("WebSocket transport error during key exchange");
                         return None;
                     }
-                    _ => continue,
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                    _ => return None,
                 }
             }
         })
@@ -346,6 +509,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                 break 'session;
             }
         };
+
+        if protected && !send_json(&mut ws_sender, &OutgoingMessage::Joined).await {
+            break 'session;
+        }
 
         for (peer_id, peer_key, peer_pq_key, peer_sig) in peers {
             if !send_json(
@@ -496,8 +663,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: String) {
                             tracing::info!("WebSocket closed by client: {}", conn_id);
                             break;
                         }
-                        Some(Err(e)) => {
-                            tracing::error!("WebSocket error for {}: {}", conn_id, e);
+                        Some(Err(_)) => {
+                            tracing::warn!("WebSocket transport error");
                             break;
                         }
                         None => break,

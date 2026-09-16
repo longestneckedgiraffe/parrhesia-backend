@@ -9,15 +9,15 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
-use sqlx::sqlite::SqlitePoolOptions;
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
+use sqlx::sqlite::SqlitePoolOptions;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use uuid::Uuid;
 
 use parrhesia::config::Config;
@@ -40,6 +40,9 @@ fn test_config() -> Config {
     Config {
         database_url: String::new(),
         port: 0,
+        bind_address: "127.0.0.1".parse().unwrap(),
+        allowed_origins: vec!["https://parrhesia.chat".into()],
+        trusted_proxies: vec![],
         inactivity_expiry_hours: 24,
         cleanup_interval_mins: 5,
     }
@@ -65,7 +68,12 @@ async fn spawn_app() -> (SocketAddr, SqlitePool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("serve");
     });
 
     (addr, pool)
@@ -78,9 +86,13 @@ async fn create_room(pool: &SqlitePool) -> String {
 }
 
 async fn open(addr: SocketAddr, room: &str) -> Ws {
-    let (ws, _resp) = connect_async(format!("ws://{addr}/ws/{room}"))
-        .await
-        .expect("ws connect");
+    let mut request = format!("ws://{addr}/ws/{room}")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Origin", "https://parrhesia.chat".parse().unwrap());
+    let (ws, _resp) = connect_async(request).await.expect("ws connect");
     ws
 }
 
@@ -227,10 +239,16 @@ async fn a_message_is_relayed_to_the_other_peer() {
 
     let relayed = next_json(&mut b).await;
     assert_eq!(relayed["type"], "message");
-    assert_eq!(relayed["peer_id"], a_id, "relayed message keeps the sender id");
+    assert_eq!(
+        relayed["peer_id"], a_id,
+        "relayed message keeps the sender id"
+    );
     assert_eq!(relayed["payload"], "opaque-ciphertext");
     assert_eq!(relayed["epoch"], 7, "epoch is passed through unchanged");
-    assert_eq!(relayed["counter"], 42, "counter is passed through unchanged");
+    assert_eq!(
+        relayed["counter"], 42,
+        "counter is passed through unchanged"
+    );
 }
 
 #[tokio::test]

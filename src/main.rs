@@ -15,7 +15,7 @@ async fn main() {
         .init();
 
     let config = Config::from_env();
-    let port = config.port;
+    let addr = SocketAddr::new(config.bind_address, config.port);
 
     let pool = db::init_pool(&config.database_url)
         .await
@@ -29,12 +29,16 @@ async fn main() {
 
     let app = parrhesia::app(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("Starting server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("Failed to bind to address");
 
-    axum::serve(listener, app).await.expect("Server failed");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("Server failed");
 }

@@ -1,17 +1,20 @@
+pub mod admission;
 pub mod cleanup;
 pub mod config;
 pub mod db;
+pub mod passwords;
 pub mod state;
 
 mod routes;
 mod security;
 
 use axum::{
+    Router,
+    extract::DefaultBodyLimit,
     middleware,
     routing::{get, post},
-    Router,
 };
-use http::{header, HeaderValue, Method};
+use http::{HeaderValue, Method, header};
 use tower_http::cors::CorsLayer;
 
 use crate::state::AppState;
@@ -23,7 +26,14 @@ use crate::state::AppState;
 /// hand-rolled subset of it.
 pub fn app(state: AppState) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin("https://parrhesia.chat".parse::<HeaderValue>().unwrap())
+        .allow_origin(
+            state
+                .config
+                .allowed_origins
+                .iter()
+                .map(|s| s.parse::<HeaderValue>().expect("validated origin"))
+                .collect::<Vec<_>>(),
+        )
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::CONTENT_TYPE]);
 
@@ -32,6 +42,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/rooms/:id", get(routes::rooms::get_room))
         .route("/ws/:room_id", get(routes::ws::ws_handler))
         .route("/health", get(|| async { "OK" }))
+        .layer(DefaultBodyLimit::max(4096))
         .layer(middleware::from_fn(security::security_headers))
         .layer(cors)
         .with_state(state)

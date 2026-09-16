@@ -1,15 +1,53 @@
-use std::env;
+use std::{env, net::IpAddr};
 
 pub struct Config {
     pub database_url: String,
     pub port: u16,
+    pub bind_address: IpAddr,
+    pub allowed_origins: Vec<String>,
+    pub trusted_proxies: Vec<IpAddr>,
     pub inactivity_expiry_hours: u64,
     pub cleanup_interval_mins: u64,
 }
 
 impl Config {
     pub fn from_env() -> Self {
+        let allowed_origins: Vec<String> = env::var("ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| "https://parrhesia.chat".into())
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .collect();
+        assert!(
+            !allowed_origins.is_empty()
+                && allowed_origins.iter().all(|s| {
+                    let Ok(uri) = s.parse::<http::Uri>() else {
+                        return false;
+                    };
+                    matches!(uri.scheme_str(), Some("https" | "http"))
+                        && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
+                        && uri.path() == "/"
+                        && uri.query().is_none()
+                        && !s.ends_with('/')
+                        && s.parse::<http::HeaderValue>().is_ok()
+                }),
+            "ALLOWED_ORIGINS must contain exact http(s) origins without trailing slashes"
+        );
         Self {
+            bind_address: env::var("BIND_ADDRESS")
+                .unwrap_or_else(|_| "127.0.0.1".into())
+                .parse()
+                .expect("BIND_ADDRESS must be an IP address"),
+            allowed_origins,
+            trusted_proxies: env::var("TRUSTED_PROXY_IPS")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    s.trim()
+                        .parse()
+                        .expect("TRUSTED_PROXY_IPS must contain IP addresses")
+                })
+                .collect(),
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite:./parrhesia.db?mode=rwc".to_string()),
             port: env::var("PORT")
@@ -40,6 +78,9 @@ mod tests {
         Config {
             database_url: String::new(),
             port: 0,
+            bind_address: "127.0.0.1".parse().unwrap(),
+            allowed_origins: vec!["https://parrhesia.chat".into()],
+            trusted_proxies: vec![],
             inactivity_expiry_hours: hours,
             cleanup_interval_mins: 5,
         }
