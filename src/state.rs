@@ -163,14 +163,25 @@ impl AppState {
             })
             .collect();
         let receiver = room.tx.subscribe();
+        let joined = RoomEvent::PeerJoined {
+            from: conn_id.to_string(),
+            public_key: participant.public_key.clone(),
+            pq_public_key: participant.pq_public_key.clone(),
+            sig: participant.sig.clone(),
+        };
         room.participants.insert(conn_id.to_string(), participant);
+        let _ = room.tx.send(joined);
         JoinOutcome::Joined { receiver, peers }
     }
 
     pub async fn detach(&self, room_id: &str, conn_id: &str) {
         let mut rooms = self.rooms.write().await;
         if let Some(room) = rooms.get_mut(room_id) {
-            room.participants.remove(conn_id);
+            if room.participants.remove(conn_id).is_some() {
+                let _ = room.tx.send(RoomEvent::PeerLeft {
+                    from: conn_id.to_string(),
+                });
+            }
             if room.participants.is_empty() {
                 room.creator_id = None;
             }

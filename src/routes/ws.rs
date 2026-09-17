@@ -411,8 +411,6 @@ async fn handle_socket(
         }
     };
 
-    let mut announced = false;
-
     'session: {
         if !send_json(
             &mut ws_sender,
@@ -530,14 +528,6 @@ async fn handle_socket(
                 break 'session;
             }
         }
-
-        let _ = tx.send(RoomEvent::PeerJoined {
-            from: conn_id.clone(),
-            public_key,
-            pq_public_key,
-            sig: announce_sig,
-        });
-        announced = true;
 
         let mut ping_interval = interval(PING_INTERVAL);
         let mut last_pong = Instant::now();
@@ -676,12 +666,6 @@ async fn handle_socket(
     }
 
     state.detach(&room_id, &conn_id).await;
-
-    if announced {
-        let _ = tx.send(RoomEvent::PeerLeft {
-            from: conn_id.clone(),
-        });
-    }
 
     tracing::info!("Connection {} disconnected from room {}", conn_id, room_id);
 }

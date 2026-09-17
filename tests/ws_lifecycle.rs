@@ -287,3 +287,78 @@ async fn connecting_to_an_unknown_room_is_closed_without_welcome() {
         Some(Ok(other)) => panic!("expected close/none for unknown room, got: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn membership_events_are_published_before_later_snapshots() {
+    use parrhesia::state::{JoinOutcome, Participant, RoomEvent};
+
+    let (_, pool) = spawn_app().await;
+    let room = create_room(&pool).await;
+    let state = AppState::new(pool, test_config());
+    state.attach(&room, "a").await.unwrap().unwrap();
+    let participant = Participant {
+        public_key: b64_zeros(MLDSA_LEN),
+        pq_public_key: b64_zeros(MLKEM_LEN),
+        sig: None,
+    };
+    let JoinOutcome::Joined { mut receiver, .. } =
+        state.join(&room, "a", participant.clone(), 16).await
+    else {
+        panic!("first participant should join");
+    };
+    while receiver.try_recv().is_ok() {}
+    let JoinOutcome::Joined { peers, .. } = state.join(&room, "b", participant.clone(), 16).await
+    else {
+        panic!("second participant should join");
+    };
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].0, "a");
+    state.detach(&room, "b").await;
+    let JoinOutcome::Joined { peers, .. } = state.join(&room, "c", participant, 16).await else {
+        panic!("replacement participant should join");
+    };
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].0, "a");
+    assert!(matches!(receiver.try_recv(), Ok(RoomEvent::PeerJoined { from, .. }) if from == "b"));
+    assert!(matches!(receiver.try_recv(), Ok(RoomEvent::PeerLeft { from }) if from == "b"));
+    assert!(matches!(receiver.try_recv(), Ok(RoomEvent::PeerJoined { from, .. }) if from == "c"));
+    state.detach(&room, "b").await;
+    assert!(receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn rejoining_with_the_same_keys_receives_a_new_id_and_can_relay() {
+    let (addr, pool) = spawn_app().await;
+    let room = create_room(&pool).await;
+    let (mut a, _) = join(addr, &room).await;
+    let (mut b, first_welcome) = join(addr, &room).await;
+    assert_eq!(next_json(&mut b).await["type"], "peer_key");
+    assert_eq!(next_json(&mut a).await["type"], "peer_joined");
+    drop(b);
+    let left = next_json(&mut a).await;
+    assert_eq!(left["type"], "peer_left");
+    assert_eq!(left["peer_id"], first_welcome["peer_id"]);
+
+    let (mut b, second_welcome) = join(addr, &room).await;
+    assert_ne!(first_welcome["peer_id"], second_welcome["peer_id"]);
+    assert_eq!(next_json(&mut b).await["type"], "peer_key");
+    let joined = next_json(&mut a).await;
+    assert_eq!(joined["type"], "peer_joined");
+    assert_eq!(joined["peer_id"], second_welcome["peer_id"]);
+    for reverse in [false, true] {
+        let (sender, receiver) = if reverse {
+            (&mut b, &mut a)
+        } else {
+            (&mut a, &mut b)
+        };
+        sender
+            .send(Message::Text(
+                json!({"type": "message", "payload": "rejoined"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let message = next_json(receiver).await;
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["payload"], "rejoined");
+    }
+}
