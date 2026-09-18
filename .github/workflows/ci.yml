@@ -1,36 +1,105 @@
-name: CI
+name: CI and deployment
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
-# Cancel in-progress runs for the same ref when a new commit is pushed.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: Build & test
-    runs-on: ubuntu-latest
+  test-build:
+    name: Test and build Linux release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+      - name: Test application
+        run: cargo test --locked --release
+      - name: Build release executable
+        run: cargo build --locked --release
+      - name: Package release
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          mkdir dist
+          cp target/release/parrhesia dist/parrhesia
+          printf '%s\n' "$RELEASE_COMMIT" > dist/commit.txt
+          cd dist
+          sha256sum parrhesia > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: parrhesia-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --locked --verbose
-
-      - name: Run tests
-        run: cargo test --locked --verbose
+  deploy:
+    name: Deploy NYC
+    needs: test-build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production-nyc
+    concurrency:
+      group: production-nyc
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: parrhesia-${{ github.sha }}
+          path: dist
+      - name: Skip a superseded commit
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          current=$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [ "$current" = "$RELEASE_COMMIT" ]; then
+            echo 'deploy=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'A newer commit is on main; skipping this deployment.'
+          fi
+      - name: Install and check release
+        if: steps.latest.outputs.deploy == 'true'
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          test -n "$DEPLOY_SSH_KEY"
+          test "$(cat dist/commit.txt)" = "$RELEASE_COMMIT"
+          (cd dist && sha256sum --check SHA256SUMS)
+          digest=$(sha256sum dist/parrhesia | cut -d ' ' -f 1)
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/parrhesia-ssh.XXXXXX")
+          trap 'rm -rf -- "$ssh_dir"' EXIT
+          chmod 700 "$ssh_dir"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          chmod 600 "$ssh_dir/key"
+          timeout 180 ssh -T -i "$ssh_dir/key" -p "$DEPLOY_PORT" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+            -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "parrhesia-deploy@$DEPLOY_HOST" "deploy $RELEASE_COMMIT $digest" < dist/parrhesia
